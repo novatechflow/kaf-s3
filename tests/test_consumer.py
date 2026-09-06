@@ -529,3 +529,124 @@ def test_prefix_that_collapses_to_empty_is_rejected(mocker, consumer_config):
     cfg["s3"]["prefix"] = "/"
     with pytest.raises(ValueError):
         S3Consumer(cfg)
+
+
+@pytest.mark.parametrize("payload", [
+    b'{"order_id": 42, "status": "paid"}',
+    b'{"a": {"b": [1, 2]}}',
+    b'{}',
+    b'{"s3_key": "k"}',
+    b'{"s3_bucket": "b"}',
+    b'{"s3_bucket": 1, "s3_key": 2}',
+])
+def test_inline_json_objects_are_not_mistaken_for_references(mocker, consumer_config, payload):
+    """A JSON object that names no bucket and key is an ordinary inline payload."""
+    mocker.patch("s3_connector.consumer.boto3")
+    mock_consumer_class = mocker.patch("s3_connector.consumer.Consumer")
+    mock_consumer_class.return_value.poll.return_value = _msg(payload)
+
+    assert S3Consumer(consumer_config).poll() == payload
+
+
+def test_incomplete_reference_is_skipped_when_inline_is_disabled(mocker, consumer_config):
+    """With inline disabled, a JSON object is still reported as a bad reference."""
+    mocker.patch("s3_connector.consumer.boto3")
+    mock_consumer_class = mocker.patch("s3_connector.consumer.Consumer")
+    mock_consumer_class.return_value.poll.return_value = _msg(b'{"s3_key": "k"}')
+
+    skips = []
+    cfg = json.loads(json.dumps(consumer_config))
+    cfg["s3"]["allow_inline_payloads"] = False
+    cfg["hooks"] = {"skipped": lambda reason, data: skips.append(reason)}
+
+    assert S3Consumer(cfg).poll() is None
+    assert skips == ["missing_key"]
+
+
+def test_commit_is_forced_synchronous_when_deletes_are_pending(mocker, consumer_config):
+    """An async commit has not reached the broker, so deleting on its return is unsafe."""
+    mock_boto3 = mocker.patch("s3_connector.consumer.boto3")
+    mock_consumer_class = mocker.patch("s3_connector.consumer.Consumer")
+
+    calls = []
+    mock_consumer_class.return_value.commit.side_effect = lambda **kw: calls.append(kw["asynchronous"])
+    ref = {"s3_bucket": "test-bucket", "s3_key": "test-key"}
+    mock_consumer_class.return_value.poll.return_value = _msg(json.dumps(ref).encode("utf-8"))
+    response = {"ETag": '"etag"', "Body": MagicMock()}
+    response["Body"].read.return_value = b"payload"
+    mock_boto3.client.return_value.get_object.return_value = response
+
+    cfg = json.loads(json.dumps(consumer_config))
+    cfg["kafka"]["enable.auto.commit"] = False
+    cfg["s3"]["require_integrity"] = False
+    consumer = S3Consumer(cfg)
+
+    consumer.poll()
+    consumer.commit()
+
+    assert calls == [False]
+    mock_boto3.client.return_value.delete_object.assert_called_once()
+
+
+def test_commit_stays_asynchronous_with_nothing_to_delete(mocker, consumer_config):
+    """The synchronous upgrade applies only when a deletion is waiting on it."""
+    mocker.patch("s3_connector.consumer.boto3")
+    mock_consumer_class = mocker.patch("s3_connector.consumer.Consumer")
+    calls = []
+    mock_consumer_class.return_value.commit.side_effect = lambda **kw: calls.append(kw["asynchronous"])
+
+    cfg = json.loads(json.dumps(consumer_config))
+    cfg["kafka"]["enable.auto.commit"] = False
+    S3Consumer(cfg).commit()
+
+    assert calls == [True]
+
+
+@pytest.mark.parametrize("bucket", [None, "", "   "])
+def test_empty_bucket_is_rejected(mocker, bucket):
+    """An unset S3_BUCKET env var arrives as '' and must not start a connector."""
+    mocker.patch("s3_connector.consumer.boto3")
+    mocker.patch("s3_connector.consumer.Consumer")
+    s3 = {} if bucket is None else {"bucket": bucket}
+    with pytest.raises(ValueError, match="bucket"):
+        S3Consumer({"kafka": {"bootstrap.servers": "x", "group.id": "g"}, "s3": s3})
+
+
+def test_oversized_object_is_rejected_from_content_length(mocker, consumer_config):
+    """Reject on the response header rather than transferring the payload first."""
+    mock_boto3 = mocker.patch("s3_connector.consumer.boto3")
+    mock_consumer_class = mocker.patch("s3_connector.consumer.Consumer")
+
+    ref = {"s3_bucket": "test-bucket", "s3_key": "test-key", "sha256": "unused"}
+    mock_consumer_class.return_value.poll.return_value = _msg(json.dumps(ref).encode("utf-8"))
+    body = MagicMock()
+    mock_boto3.client.return_value.get_object.return_value = {
+        "ETag": '"etag"', "ContentLength": 10_000, "Body": body,
+    }
+
+    cfg = json.loads(json.dumps(consumer_config))
+    cfg["s3"]["max_payload_bytes"] = 1024
+    with pytest.raises(DataIntegrityError):
+        S3Consumer(cfg).poll()
+
+    body.read.assert_not_called()
+
+
+@pytest.mark.parametrize("raw_size,cap", [(100_000, None), (5_000_000, None), (100_000, 4096)])
+def test_dlq_record_stays_within_the_size_cap(mocker, consumer_config, raw_size, cap):
+    """JSON escaping expands raw bytes, so the encoded record is what must be bounded."""
+    mocker.patch("s3_connector.consumer.boto3")
+    mock_consumer_class = mocker.patch("s3_connector.consumer.Consumer")
+    mock_producer_class = mocker.patch("s3_connector.consumer.Producer")
+    mock_consumer_class.return_value.poll.return_value = _msg(b"\xff" * raw_size)
+
+    cfg = json.loads(json.dumps(consumer_config))
+    cfg["kafka"]["dlq_topic"] = "dlq"
+    cfg["s3"]["allow_inline_payloads"] = False
+    if cap:
+        cfg["s3"]["dlq_max_record_bytes"] = cap
+    S3Consumer(cfg).poll()
+
+    record = mock_producer_class.return_value.produce.call_args.kwargs["value"]
+    assert len(record) <= (cap or 512 * 1024)
+    assert json.loads(record)["raw_truncated"] is True

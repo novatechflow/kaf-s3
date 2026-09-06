@@ -6,19 +6,22 @@ import json
 import logging
 from confluent_kafka import Consumer, KafkaError, KafkaException, Producer
 
-from .config import build_s3_client, split_kafka_config
+from .config import build_s3_client, parse_bool, require_bucket, split_kafka_config
 from .exceptions import DataIntegrityError
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_DLQ_MAX_RAW_BYTES = 16 * 1024
+DEFAULT_DLQ_MAX_RECORD_BYTES = 512 * 1024
 
-def _is_true(value):
+
+def _is_reference(decoded):
     """
-    Kafka config values may arrive as bools or as librdkafka-style strings.
+    A reference message must name both a bucket and a key. Any other JSON object
+    is an ordinary inline payload that happens to be JSON.
     """
-    if isinstance(value, str):
-        return value.strip().lower() in ("true", "1", "yes")
-    return bool(value)
+    return isinstance(decoded.get("s3_bucket"), str) and isinstance(decoded.get("s3_key"), str)
+
 
 class S3Consumer:
     def __init__(self, config):
@@ -33,13 +36,11 @@ class S3Consumer:
 
         if "group.id" not in kafka_config:
             raise ValueError("Kafka consumer 'group.id' must be specified.")
-        if "bucket" not in self.s3_config:
-            raise ValueError("S3 bucket must be specified in the configuration.")
+        self.s3_bucket = require_bucket(self.s3_config)
 
         client_config, kafka_dlq_topic = split_kafka_config(kafka_config)
         self.kafka_consumer = Consumer(client_config)
         self.s3_client = build_s3_client(boto3, self.s3_config)
-        self.s3_bucket = self.s3_config["bucket"]
         self.delete_after_consume = self.s3_config.get("delete_after_consume", False)
         self.allow_inline_payloads = self.s3_config.get("allow_inline_payloads", True)
         self.expected_prefix = self.s3_config.get("prefix", "").rstrip("/")
@@ -51,11 +52,15 @@ class S3Consumer:
         self.skip_callback = self.hooks.get("skipped")
         self.dlq_topic = kafka_dlq_topic or self.s3_config.get("dlq_topic")
         self.dlq_producer = Producer(client_config) if self.dlq_topic else None
+        self.dlq_max_raw_bytes = self.s3_config.get("dlq_max_raw_bytes", DEFAULT_DLQ_MAX_RAW_BYTES)
+        self.dlq_max_record_bytes = self.s3_config.get(
+            "dlq_max_record_bytes", DEFAULT_DLQ_MAX_RECORD_BYTES
+        )
 
         if self.max_payload_bytes <= 0:
             raise ValueError("max_payload_bytes must be positive.")
 
-        self.auto_commit = _is_true(kafka_config.get("enable.auto.commit", True))
+        self.auto_commit = parse_bool(kafka_config.get("enable.auto.commit"), default=True)
         self._pending_deletes = []
         if self.delete_after_consume and self.auto_commit:
             logger.warning(
@@ -92,12 +97,23 @@ class S3Consumer:
         Commits offsets, then deletes any S3 objects deferred by
         delete_after_consume. Use with 'enable.auto.commit': False for
         at-least-once delivery, committing only after the payload is processed.
+
+        When deletions are pending the commit is forced synchronous: an
+        asynchronous commit has not reached the broker yet, so deleting on its
+        return would remove the object while the offset can still be replayed.
         """
+        blocking = asynchronous and self._pending_deletes
+        if blocking:
+            logger.debug("Committing synchronously: %s S3 deletion(s) pending.", len(self._pending_deletes))
+            asynchronous = False
+
         if message is None:
             result = self.kafka_consumer.commit(asynchronous=asynchronous)
         else:
             result = self.kafka_consumer.commit(message=message, asynchronous=asynchronous)
-        self._drain_pending_deletes()
+
+        if not asynchronous:
+            self._drain_pending_deletes()
         return result
 
     def _drain_pending_deletes(self):
@@ -140,16 +156,16 @@ class S3Consumer:
             return self._skip("tombstone", topic=msg.topic())
 
         ref_message = self._parse_reference(raw_value)
-        if ref_message is None:
+        if ref_message is None or not _is_reference(ref_message):
             if self.allow_inline_payloads:
                 self._emit_metric("consume_inline", topic=msg.topic(), bytes=len(raw_value))
                 return raw_value
-            return self._skip("malformed_message", topic=msg.topic(), raw=raw_value)
-
-        s3_bucket = ref_message.get("s3_bucket")
-        s3_key = ref_message.get("s3_key")
-        if not isinstance(s3_bucket, str) or not isinstance(s3_key, str):
+            if ref_message is None:
+                return self._skip("malformed_message", topic=msg.topic(), raw=raw_value)
             return self._skip("missing_key", topic=msg.topic(), reference=ref_message)
+
+        s3_bucket = ref_message["s3_bucket"]
+        s3_key = ref_message["s3_key"]
 
         if s3_bucket != self.s3_bucket:
             raise self._integrity_error(
@@ -178,6 +194,7 @@ class S3Consumer:
             )
 
         response = self.s3_client.get_object(Bucket=s3_bucket, Key=s3_key)
+        self._check_content_length(response.get("ContentLength"), s3_key, ref_message)
         stored = self._read_capped(response["Body"], s3_key, ref_message)
 
         actual_etag = response.get("ETag", "").strip('"')
@@ -223,6 +240,19 @@ class S3Consumer:
             logger.debug("Payload is JSON but not a reference object: %s", type(decoded).__name__)
             return None
         return decoded
+
+    def _check_content_length(self, content_length, s3_key, ref_message):
+        """
+        Rejects oversized objects from the response header, before transferring
+        max_payload_bytes only to discard them.
+        """
+        if isinstance(content_length, int) and content_length > self.max_payload_bytes:
+            raise self._integrity_error(
+                "object_too_large",
+                f"S3 object {s3_key} reports {content_length} bytes, over max_payload_bytes "
+                f"{self.max_payload_bytes}",
+                ref_message,
+            )
 
     def _read_capped(self, body_stream, s3_key, ref_message):
         """
@@ -289,16 +319,35 @@ class S3Consumer:
         """
         if not self.dlq_topic or not self.dlq_producer:
             return
-        payload = {"error": error}
-        if reference is not None:
-            payload["reference"] = reference
-        if raw is not None:
-            payload["raw"] = raw.decode("utf-8", errors="replace")
+        record = self._build_dlq_record(error, reference, raw)
         try:
-            self.dlq_producer.produce(self.dlq_topic, value=json.dumps(payload).encode("utf-8"))
+            self.dlq_producer.produce(self.dlq_topic, value=record)
             self.dlq_producer.poll(0)
         except Exception as exc:  # pragma: no cover
             logger.warning("Failed to publish to DLQ %s: %s", self.dlq_topic, exc)
+
+    def _build_dlq_record(self, error, reference, raw):
+        """
+        Serialises a DLQ record, bounded so it cannot exceed the broker's
+        message size limit. JSON escaping can expand raw bytes several-fold, so
+        the encoded record is measured, not the input.
+        """
+        payload = {"error": error}
+        if reference is not None:
+            payload["reference"] = reference
+
+        if raw is None:
+            return json.dumps(payload).encode("utf-8")
+
+        keep = min(len(raw), self.dlq_max_raw_bytes)
+        while True:
+            payload["raw"] = raw[:keep].decode("utf-8", errors="replace")
+            if keep < len(raw):
+                payload["raw_truncated"] = True
+            encoded = json.dumps(payload).encode("utf-8")
+            if len(encoded) <= self.dlq_max_record_bytes or keep == 0:
+                return encoded
+            keep //= 2
 
     def _emit_metric(self, event, **data):
         """

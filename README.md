@@ -29,6 +29,10 @@ Requires Python 3.10 or newer.
 
 ## How it Works
 
+A message is treated as an S3 reference only if it is a JSON object carrying both
+`s3_bucket` and `s3_key`. Anything else — plain bytes, or JSON that is simply your own
+payload — passes through untouched when `allow_inline_payloads` is enabled.
+
 1.  The `S3Producer` receives a large payload.
 2.  It uploads the payload to a specified S3 bucket with a unique key.
 3.  It produces a small JSON message to a Kafka topic containing the S3 bucket, key, and the object's ETag.
@@ -88,6 +92,8 @@ consumer_config = {
         # "max_payload_bytes": 5 * 1024 * 1024 * 1024,  # hard cap on payload size
         # "delete_after_consume": False,   # see "Deleting consumed objects" below
         # "allow_inline_payloads": True,   # allow non-reference payloads to pass through unchanged
+        # "dlq_max_raw_bytes": 16384,      # raw bytes echoed into a DLQ record
+        # "dlq_max_record_bytes": 524288,  # hard cap on the encoded DLQ record
         # "prefix": "kafka/topic",         # enforce prefix on incoming references
         # "require_integrity": True,       # reject references carrying no etag/sha256
         # "compression": "gzip",           # decompress automatically on consume
@@ -244,7 +250,9 @@ Configuration is driven by env vars:
 - Kafka: `KAFKA_BOOTSTRAP_SERVERS`, `KAFKA_GROUP_ID` (consumer), `DLQ_TOPIC`, `KAFKA_SECURITY_PROTOCOL`, `KAFKA_SASL_*`, `KAFKA_SSL_*`, etc.
 - S3: `S3_BUCKET`, `S3_PREFIX`, `S3_DELETE_AFTER_CONSUME`, `S3_ALLOW_INLINE_PAYLOADS`, `S3_MAX_INLINE_BYTES`, `S3_MAX_PAYLOAD_BYTES`, `S3_DETERMINISTIC_KEYS`, `S3_COMPRESSION` (`gzip`), `S3_TTL_SECONDS`, `S3_SSE`, `S3_SSE_KMS_KEY_ID`.
 - App: `MODE` (`producer`|`consumer`), `TOPIC`, `POLL_TIMEOUT`, `METRICS_PORT` (default 8000), `METRICS_ADDRESS` (default all interfaces), `LOG_LEVEL`.
-- Also: `AWS_REGION`, `S3_ENDPOINT_URL`, `S3_REQUIRE_INTEGRITY`.
+- Also: `AWS_REGION`, `S3_ENDPOINT_URL`, `S3_REQUIRE_INTEGRITY`, `KAFKA_ENABLE_AUTO_COMMIT`.
+- Boolean env vars accept `true`/`1`/`yes`/`on` (case-insensitive); anything else is false.
+- With `KAFKA_ENABLE_AUTO_COMMIT=false` the container commits after each payload, giving at-least-once delivery.
 
 ### Metrics
 - `/metrics` exposes Prometheus text format on `METRICS_PORT` (default 8000).

@@ -381,3 +381,13 @@ def test_prefix_that_collapses_to_empty_is_rejected(mocker):
             "kafka": {"bootstrap.servers": "mock:9092"},
             "s3": {"bucket": "b", "prefix": "/"},
         })
+
+
+@pytest.mark.parametrize("bucket", [None, "", "   "])
+def test_empty_bucket_is_rejected(mocker, bucket):
+    """An unset S3_BUCKET env var arrives as '' and must not start a connector."""
+    mocker.patch("s3_connector.producer.boto3")
+    mocker.patch("s3_connector.producer.Producer")
+    s3 = {} if bucket is None else {"bucket": bucket}
+    with pytest.raises(ValueError, match="bucket"):
+        S3Producer({"kafka": {"bootstrap.servers": "mock:9092"}, "s3": s3})

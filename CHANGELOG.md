@@ -1,5 +1,36 @@
 # Changelog
 
+## v1.5.0
+
+### Fixed (data loss)
+- Inline JSON objects were silently dropped. Any payload small enough to stay on Kafka
+  that happened to be a JSON object was parsed as an S3 reference, found to name no
+  bucket or key, and skipped — even with `allow_inline_payloads` at its default of True.
+  A message is now treated as a reference only when it carries both `s3_bucket` and
+  `s3_key` as strings; everything else is an ordinary inline payload.
+- `commit()` drained pending S3 deletions immediately after an asynchronous commit, which
+  has not yet reached the broker. A crash in that window left the offset uncommitted and
+  the object already deleted, defeating the deferral added in v1.4.0. Commits are now
+  forced synchronous whenever deletions are pending.
+
+### Fixed
+- An unset `S3_BUCKET` arrives as `""`, and the check tested for the key rather than a
+  value, so the connector started with an empty bucket and rejected every reference. Empty
+  and whitespace-only buckets are now rejected at construction on both sides.
+- DLQ records had no size bound. A large malformed message was echoed whole, and since
+  JSON escaping expands raw bytes several-fold, the record could exceed the broker's
+  message limit and fail to publish. Records are now bounded by measuring the encoded
+  size (`dlq_max_raw_bytes`, `dlq_max_record_bytes`).
+- Oversized objects are rejected from the `ContentLength` response header instead of
+  transferring up to `max_payload_bytes` before discarding them.
+
+### Added
+- `KAFKA_ENABLE_AUTO_COMMIT` env var, and the container's consumer loop commits after each
+  payload when auto-commit is off. At-least-once delivery was previously reachable through
+  the library API only; from the container, offsets would simply never have advanced.
+- Boolean environment variables share one parser and now accept `1`, `yes` and `on`
+  alongside `true`, instead of each call site testing `== "true"`.
+
 ## v1.4.0
 
 ### Fixed (security)

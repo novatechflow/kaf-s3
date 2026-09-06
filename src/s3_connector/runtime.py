@@ -5,6 +5,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, Optional
 
+from .config import parse_bool
 from .exceptions import DataIntegrityError
 from .producer import S3Producer
 from .consumer import S3Consumer
@@ -109,6 +110,9 @@ def build_config_from_env():
         if os.getenv(env_key):
             kafka_config[key] = os.getenv(env_key)
 
+    if os.getenv("KAFKA_ENABLE_AUTO_COMMIT"):
+        kafka_config["enable.auto.commit"] = parse_bool(os.getenv("KAFKA_ENABLE_AUTO_COMMIT"))
+
     dlq_topic = os.getenv("DLQ_TOPIC")
     if dlq_topic:
         kafka_config["dlq_topic"] = dlq_topic
@@ -118,12 +122,12 @@ def build_config_from_env():
         "prefix": os.getenv("S3_PREFIX", ""),
         "region_name": os.getenv("AWS_REGION"),
         "endpoint_url": os.getenv("S3_ENDPOINT_URL"),
-        "delete_after_consume": os.getenv("S3_DELETE_AFTER_CONSUME", "false").lower() == "true",
-        "allow_inline_payloads": os.getenv("S3_ALLOW_INLINE_PAYLOADS", "true").lower() == "true",
-        "require_integrity": os.getenv("S3_REQUIRE_INTEGRITY", "true").lower() == "true",
+        "delete_after_consume": parse_bool(os.getenv("S3_DELETE_AFTER_CONSUME")),
+        "allow_inline_payloads": parse_bool(os.getenv("S3_ALLOW_INLINE_PAYLOADS"), default=True),
+        "require_integrity": parse_bool(os.getenv("S3_REQUIRE_INTEGRITY"), default=True),
         "max_inline_bytes": int(os.getenv("S3_MAX_INLINE_BYTES", "900000")),
         "max_payload_bytes": int(os.getenv("S3_MAX_PAYLOAD_BYTES", str(5 * 1024 * 1024 * 1024))),
-        "deterministic_keys": os.getenv("S3_DETERMINISTIC_KEYS", "false").lower() == "true",
+        "deterministic_keys": parse_bool(os.getenv("S3_DETERMINISTIC_KEYS")),
         "ttl_seconds": int(os.getenv("S3_TTL_SECONDS")) if os.getenv("S3_TTL_SECONDS") else None,
         "compression": os.getenv("S3_COMPRESSION"),
         "server_side_encryption": os.getenv("S3_SSE"),
@@ -169,7 +173,12 @@ def _run_consumer(config, topic, registry):
     try:
         while True:
             try:
-                consumer.poll(timeout=timeout)
+                payload = consumer.poll(timeout=timeout)
+                if payload is not None and not consumer.auto_commit:
+                    # Commit only once the payload is in hand, which is what makes
+                    # KAFKA_ENABLE_AUTO_COMMIT=false at-least-once rather than a
+                    # consumer whose offsets never advance.
+                    consumer.commit(asynchronous=False)
             except DataIntegrityError as exc:
                 logger.error("Integrity failure, message dropped: %s", exc)
             except KeyboardInterrupt:
