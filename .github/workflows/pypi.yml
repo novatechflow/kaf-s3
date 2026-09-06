@@ -16,7 +16,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.release.tag_name || github.ref }}
           fetch-depth: 0  # Fetch all history for setuptools-scm
@@ -34,7 +34,7 @@ jobs:
           VERSION="${TAG_NAME#v}"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Building version: $VERSION"
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install build deps
