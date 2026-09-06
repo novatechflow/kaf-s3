@@ -1,14 +1,31 @@
-import json
 import logging
 import os
+import sys
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Callable, Dict, Any
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Callable, Dict, Optional
 
+from .exceptions import DataIntegrityError
 from .producer import S3Producer
 from .consumer import S3Consumer
 
 logger = logging.getLogger(__name__)
+
+ALLOWED_METRIC_LABELS = ("topic", "partition", "reason")
+COUNTABLE_METRIC_FIELDS = ("bytes",)
+
+
+def escape_label_value(value: Any) -> str:
+    """
+    Escapes a label value for the Prometheus text exposition format.
+    """
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+    )
+
 
 class MetricsRegistry:
     """
@@ -18,7 +35,7 @@ class MetricsRegistry:
         self._counters = {}
         self._lock = threading.Lock()
 
-    def inc(self, name: str, labels: Dict[str, Any] | None = None, value: int = 1):
+    def inc(self, name: str, labels: Optional[Dict[str, Any]] = None, value: int = 1):
         key = (name, tuple(sorted((labels or {}).items())))
         with self._lock:
             self._counters[key] = self._counters.get(key, 0) + value
@@ -28,7 +45,7 @@ class MetricsRegistry:
         with self._lock:
             for (name, labels), value in self._counters.items():
                 if labels:
-                    label_str = ",".join(f'{k}="{v}"' for k, v in labels)
+                    label_str = ",".join(f'{k}="{escape_label_value(v)}"' for k, v in labels)
                     lines.append(f"{name}{{{label_str}}} {value}")
                 else:
                     lines.append(f"{name} {value}")
@@ -55,11 +72,12 @@ def metrics_handler(registry: MetricsRegistry):
     return Handler
 
 
-def start_metrics_server(registry: MetricsRegistry, port: int):
-    srv = HTTPServer(("", port), metrics_handler(registry))
+def start_metrics_server(registry: MetricsRegistry, port: int, address: str = ""):
+    srv = ThreadingHTTPServer((address, port), metrics_handler(registry))
+    srv.daemon_threads = True
     thread = threading.Thread(target=srv.serve_forever, daemon=True)
     thread.start()
-    logger.info("Metrics server listening on :%s", port)
+    logger.info("Metrics server listening on %s:%s", address or "0.0.0.0", port)
     return srv
 
 
@@ -69,7 +87,6 @@ def build_config_from_env():
     }
     if os.getenv("KAFKA_GROUP_ID"):
         kafka_config["group.id"] = os.getenv("KAFKA_GROUP_ID")
-    # Optional security settings
     for key in [
         "security.protocol",
         "sasl.mechanism",
@@ -92,8 +109,10 @@ def build_config_from_env():
         "bucket": os.getenv("S3_BUCKET", ""),
         "prefix": os.getenv("S3_PREFIX", ""),
         "region_name": os.getenv("AWS_REGION"),
+        "endpoint_url": os.getenv("S3_ENDPOINT_URL"),
         "delete_after_consume": os.getenv("S3_DELETE_AFTER_CONSUME", "false").lower() == "true",
         "allow_inline_payloads": os.getenv("S3_ALLOW_INLINE_PAYLOADS", "true").lower() == "true",
+        "require_integrity": os.getenv("S3_REQUIRE_INTEGRITY", "true").lower() == "true",
         "max_inline_bytes": int(os.getenv("S3_MAX_INLINE_BYTES", "900000")),
         "max_payload_bytes": int(os.getenv("S3_MAX_PAYLOAD_BYTES", str(5 * 1024 * 1024 * 1024))),
         "deterministic_keys": os.getenv("S3_DETERMINISTIC_KEYS", "false").lower() == "true",
@@ -109,9 +128,51 @@ def build_config_from_env():
 
 
 def metric_hook(registry: MetricsRegistry) -> Callable[[str, Dict[str, Any]], None]:
+    """
+    Adapts connector events onto the registry, keeping label cardinality bounded:
+    only allow-listed labels become series, and size fields become byte counters
+    rather than one series per distinct size.
+    """
     def hook(event: str, data: Dict[str, Any]):
-        registry.inc(event, data)
+        labels = {k: v for k, v in data.items() if k in ALLOWED_METRIC_LABELS and v is not None}
+        registry.inc(event, labels)
+        for field in COUNTABLE_METRIC_FIELDS:
+            amount = data.get(field)
+            if isinstance(amount, int):
+                registry.inc(f"{event}_{field}", labels, amount)
     return hook
+
+
+def _run_producer(config, topic, registry):
+    producer = S3Producer(config)
+    try:
+        for line in iter(sys.stdin.buffer.readline, b""):
+            payload = line.rstrip(b"\n")
+            producer.produce(topic, payload)
+            registry.inc("stdin_lines")
+    finally:
+        producer.close()
+
+
+def _run_consumer(config, topic, registry):
+    consumer = S3Consumer(config)
+    consumer.subscribe([topic])
+    timeout = float(os.getenv("POLL_TIMEOUT", "5.0"))
+    try:
+        while True:
+            try:
+                consumer.poll(timeout=timeout)
+            except DataIntegrityError as exc:
+                logger.error("Integrity failure, message dropped: %s", exc)
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                logger.exception("Unexpected error while consuming: %s", exc)
+                registry.inc("consume_unhandled_error")
+    except KeyboardInterrupt:
+        logger.info("Shutting down consumer.")
+    finally:
+        consumer.close()
 
 
 def run():
@@ -120,26 +181,22 @@ def run():
     topic = os.getenv("TOPIC")
     if not topic:
         raise ValueError("TOPIC is required.")
+    if mode not in ("producer", "consumer"):
+        raise ValueError(f"Unknown MODE {mode}")
 
     metrics_port = int(os.getenv("METRICS_PORT", "8000"))
+    metrics_address = os.getenv("METRICS_ADDRESS", "")
     registry = MetricsRegistry()
-    start_metrics_server(registry, metrics_port)
+    start_metrics_server(registry, metrics_port, metrics_address)
 
     config = build_config_from_env()
     config["hooks"]["metrics"] = metric_hook(registry)
 
     if mode == "producer":
-        producer = S3Producer(config)
-        # Simple stdin producer for demo/prod piping
-        for line in iter(os.sys.stdin.buffer.readline, b""):
-            payload = line.rstrip(b"\n")
-            producer.produce(topic, payload)
-            registry.inc("stdin_lines")
-    elif mode == "consumer":
-        consumer = S3Consumer(config)
-        consumer.subscribe([topic])
-        timeout = float(os.getenv("POLL_TIMEOUT", "5.0"))
-        while True:
-            consumer.poll(timeout=timeout)
+        _run_producer(config, topic, registry)
     else:
-        raise ValueError(f"Unknown MODE {mode}")
+        _run_consumer(config, topic, registry)
+
+
+if __name__ == "__main__":
+    run()

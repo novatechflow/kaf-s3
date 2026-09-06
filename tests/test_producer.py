@@ -198,3 +198,85 @@ def test_build_key_with_prefix_and_deterministic(mocker):
     key2 = producer._build_s3_key(b"payload")
     assert key1 == key2
     assert key1.startswith("pfx/")
+
+
+def test_dlq_topic_is_not_passed_to_librdkafka(mocker):
+    """dlq_topic is a connector setting; librdkafka rejects unknown properties."""
+    mocker.patch("s3_connector.producer.boto3")
+    mock_kafka_producer_class = mocker.patch("s3_connector.producer.Producer")
+
+    cfg = {
+        "kafka": {"bootstrap.servers": "mock:9092", "dlq_topic": "my-dlq"},
+        "s3": {"bucket": "test-bucket"},
+    }
+    producer = S3Producer(cfg)
+
+    assert "dlq_topic" not in mock_kafka_producer_class.call_args.args[0]
+    assert producer.dlq_topic == "my-dlq"
+
+
+def test_deterministic_keys_are_not_deleted_on_delivery_failure(mocker):
+    """A shared deterministic key may still back a delivered message."""
+    mock_boto3 = mocker.patch("s3_connector.producer.boto3")
+    mock_kafka_producer_class = mocker.patch("s3_connector.producer.Producer")
+    mock_kafka_producer_instance = mock_kafka_producer_class.return_value
+    mock_boto3.client.return_value.put_object.return_value = {"ETag": '"12345"'}
+
+    def produce_side_effect(*args, **kwargs):
+        kwargs["on_delivery"](Exception("delivery-fail"), mocker.Mock())
+    mock_kafka_producer_instance.produce.side_effect = produce_side_effect
+
+    cfg = {
+        "kafka": {"bootstrap.servers": "mock:9092"},
+        "s3": {"bucket": "test-bucket", "max_inline_bytes": 0, "deterministic_keys": True},
+    }
+    producer = S3Producer(cfg)
+    producer.produce("test-topic", b"This is a test payload")
+
+    mock_boto3.client.return_value.delete_object.assert_not_called()
+
+
+def test_flush_and_close(mocker, producer_config):
+    """Callers can block until delivery instead of losing queued messages."""
+    mocker.patch("s3_connector.producer.boto3")
+    mock_kafka_producer_class = mocker.patch("s3_connector.producer.Producer")
+    mock_kafka_producer_class.return_value.flush.return_value = 0
+
+    producer = S3Producer(producer_config)
+    assert producer.flush(1.0) == 0
+    mock_kafka_producer_class.return_value.flush.assert_called_once_with(1.0)
+
+    producer.close(2.0)
+    assert mock_kafka_producer_class.return_value.flush.call_args.args == (2.0,)
+
+
+def test_context_manager_closes_producer(mocker, producer_config):
+    """The context manager flushes on exit."""
+    mocker.patch("s3_connector.producer.boto3")
+    mock_kafka_producer_class = mocker.patch("s3_connector.producer.Producer")
+    mock_kafka_producer_class.return_value.flush.return_value = 0
+
+    with S3Producer(producer_config):
+        pass
+
+    mock_kafka_producer_class.return_value.flush.assert_called_once()
+
+
+def test_s3_client_uses_region_and_endpoint(mocker):
+    """region_name and endpoint_url reach the boto3 client instead of being ignored."""
+    mock_boto3 = mocker.patch("s3_connector.producer.boto3")
+    mocker.patch("s3_connector.producer.Producer")
+
+    cfg = {
+        "kafka": {"bootstrap.servers": "mock:9092"},
+        "s3": {
+            "bucket": "test-bucket",
+            "region_name": "eu-central-1",
+            "endpoint_url": "https://minio.local:9000",
+        },
+    }
+    S3Producer(cfg)
+
+    mock_boto3.client.assert_called_once_with(
+        "s3", region_name="eu-central-1", endpoint_url="https://minio.local:9000"
+    )

@@ -6,3 +6,5 @@ dist/
 build/
 *.egg-info/
 .eggs/
+.DS_Store
+src/s3_connector/_version.py

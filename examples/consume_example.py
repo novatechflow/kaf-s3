@@ -1,7 +1,3 @@
-import sys
-# Add the src directory to the Python path
-sys.path.append('../src')
-
 from s3_connector import S3Consumer, DataIntegrityError
 
 # NOTE: You must have Kafka and S3 (or a compatible service like MinIO)

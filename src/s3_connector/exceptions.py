@@ -1,6 +1,7 @@
 class DataIntegrityError(Exception):
     """
-    Raised when the ETag of the downloaded S3 object does not match the
-    ETag from the Kafka message, indicating potential data corruption.
+    Raised when a payload fetched from S3 cannot be trusted: the reference does
+    not match the stored object, carries no verifiable checksum, points outside
+    the configured bucket or prefix, or exceeds the configured size limit.
     """
     pass

@@ -1,6 +1,6 @@
 image:
   repository: ghcr.io/2pk03/kaf-s3-connector
-  tag: latest
+  tag: ""
   pullPolicy: IfNotPresent
 
 replicaCount: 1
@@ -17,7 +17,26 @@ env:
   S3_BUCKET: my-large-messages-bucket
   METRICS_PORT: "8000"
 
-resources: {}
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
 
 nodeSelector: {}
 tolerations: []

@@ -7,13 +7,16 @@ name = "kaf-s3-connector"
 dynamic = ["version"]
 description = "A Python library to handle large Kafka messages using S3."
 readme = "README.md"
-requires-python = ">=3.6"
+requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
     {name = "2pk03"}
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
@@ -21,6 +24,9 @@ dependencies = [
     "boto3>=1.20.0",
     "confluent-kafka>=1.8.2",
 ]
+
+[project.scripts]
+kaf-s3-connector = "s3_connector.runtime:run"
 
 [project.urls]
 Homepage = "https://github.com/2pk03/kaf-s3"

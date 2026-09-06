@@ -7,6 +7,8 @@ import time
 import uuid
 from confluent_kafka import Producer
 
+from .config import build_s3_client, split_kafka_config
+
 logger = logging.getLogger(__name__)
 
 class S3Producer:
@@ -23,17 +25,18 @@ class S3Producer:
         if "bucket" not in self.s3_config:
             raise ValueError("S3 bucket must be specified in the configuration.")
 
-        self.kafka_producer = Producer(kafka_config)
-        self.dlq_topic = kafka_config.get("dlq_topic") or self.s3_config.get("dlq_topic")
-        self.s3_client = boto3.client("s3")
+        client_config, kafka_dlq_topic = split_kafka_config(kafka_config)
+        self.kafka_producer = Producer(client_config)
+        self.dlq_topic = kafka_dlq_topic or self.s3_config.get("dlq_topic")
+        self.s3_client = build_s3_client(boto3, self.s3_config)
         self.s3_bucket = self.s3_config["bucket"]
         self.max_inline_bytes = self.s3_config.get("max_inline_bytes", 900_000)
         self.max_payload_bytes = self.s3_config.get("max_payload_bytes", 5 * 1024 * 1024 * 1024)
         self.s3_prefix = self.s3_config.get("prefix", "").rstrip("/")
         self.deterministic_keys = self.s3_config.get("deterministic_keys", False)
         self.ttl_seconds = self.s3_config.get("ttl_seconds")
-        self.compression = self.s3_config.get("compression")  # None | "gzip"
-        self.sse = self.s3_config.get("server_side_encryption")  # None | "AES256" | "aws:kms"
+        self.compression = self.s3_config.get("compression")
+        self.sse = self.s3_config.get("server_side_encryption")
         self.sse_kms_key_id = self.s3_config.get("sse_kms_key_id")
         self.metric_callback = self.hooks.get("metrics")
 
@@ -62,10 +65,8 @@ class S3Producer:
         if payload_length > self.max_payload_bytes:
             raise ValueError(f"Payload size {payload_length} exceeds max_payload_bytes {self.max_payload_bytes}.")
 
-        # Inline payloads stay on Kafka for small messages.
         if payload_length <= self.max_inline_bytes:
             self.kafka_producer.produce(topic, key=key, value=bytes(payload))
-            # Poll to trigger delivery callbacks without forcing a flush on every message.
             self.kafka_producer.poll(0)
             self._emit_metric("produce_inline", topic=topic, bytes=payload_length)
             return
@@ -77,7 +78,6 @@ class S3Producer:
             payload_to_store = gzip.compress(payload)
             compression = "gzip"
 
-        # Upload to S3
         put_kwargs = dict(
             Bucket=self.s3_bucket,
             Key=s3_key,
@@ -92,11 +92,9 @@ class S3Producer:
 
         response = self.s3_client.put_object(**put_kwargs)
 
-        # Get ETag for integrity check
         etag = response.get("ETag", "").strip('"')
         sha256 = hashlib.sha256(payload).hexdigest()
 
-        # Create reference message
         reference_message = {
             "s3_bucket": self.s3_bucket,
             "s3_key": s3_key,
@@ -116,14 +114,46 @@ class S3Producer:
             self._cleanup_s3_object(s3_key)
             raise
 
-        # Allow queued delivery reports to be served without blocking throughput.
         self.kafka_producer.poll(0)
         self._emit_metric("produce_offloaded", topic=topic, bytes=payload_length, s3_key=s3_key)
+
+    def flush(self, timeout=30.0):
+        """
+        Blocks until queued messages are delivered or the timeout expires.
+
+        :return: The number of messages still undelivered.
+        """
+        return self.kafka_producer.flush(timeout)
+
+    def close(self, timeout=30.0):
+        """
+        Flushes outstanding messages and logs any that could not be delivered.
+        """
+        remaining = self.flush(timeout)
+        if remaining:
+            logger.error("%s message(s) still undelivered after flush timeout.", remaining)
+        return remaining
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
 
     def _cleanup_s3_object(self, s3_key):
         """
         Best-effort cleanup of an S3 object, used when Kafka publish fails.
+
+        Skipped for deterministic keys, where the same object may still be
+        referenced by another successfully delivered message.
         """
+        if self.deterministic_keys:
+            logger.warning(
+                "Leaving S3 object %s in place after produce error: deterministic keys may be shared.",
+                s3_key,
+            )
+            return
         try:
             self.s3_client.delete_object(Bucket=self.s3_bucket, Key=s3_key)
         except Exception as exc:  # pragma: no cover - best-effort cleanup
