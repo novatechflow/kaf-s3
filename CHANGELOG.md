@@ -1,5 +1,26 @@
 # Changelog
 
+## v1.8.0
+
+### Fixed
+- `commit(message=...)` deleted every deferred S3 object, not just those the commit
+  covered. Committing one partition's message removed objects belonging to other
+  partitions and to later offsets that were still in flight; a crash then lost them,
+  because their offsets had never been committed. Deferred deletions are now tracked per
+  partition and offset, and a message commit drains only that partition up to that offset.
+- A consumer group rebalance stranded the new partition owner. `subscribe()` registered no
+  rebalance callbacks, so partitions taken away still had deferred deletions queued, and
+  the next commit deleted objects for messages another member was about to reprocess.
+  Revoked and lost partitions now drop their pending deletions.
+
+Both are reachable only with `delete_after_consume` and manual commits — the combination
+the README recommends for at-least-once delivery — and only in a multi-consumer group,
+which is the normal deployment.
+
+### Changed
+- `subscribe()` accepts `on_assign`, `on_revoke` and `on_lost`. The connector registers its
+  own listeners either way and calls yours after its own bookkeeping.
+
 ## v1.7.0
 
 ### Fixed

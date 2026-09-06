@@ -153,6 +153,7 @@ from s3_connector import S3Consumer
 # Initialize consumer with the config
 consumer = S3Consumer(config=consumer_config)
 consumer.subscribe(["large-messages-topic"])
+# subscribe() also accepts on_assign / on_revoke / on_lost rebalance callbacks.
 
 print("Waiting for messages...")
 while True:
@@ -188,6 +189,10 @@ A connector instance is not safe to share across threads. Give each thread its o
 `S3Producer` or `S3Consumer`, which is also what `confluent-kafka` expects for consumers.
 
 ### Deleting consumed objects
+
+Deferred deletions are tracked per partition and offset: `commit(message=...)` deletes
+only what that commit covers, and partitions lost to a rebalance drop their pending
+deletions so the member that takes them over still finds the objects.
 
 Objects written with `deterministic_keys` are never deleted on consume: deduplication
 means several messages can reference one object, so removing it would strand the rest.

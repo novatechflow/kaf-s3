@@ -74,7 +74,7 @@ class S3Consumer:
             raise ValueError("max_payload_bytes must be positive.")
 
         self.auto_commit = parse_bool(kafka_config.get("enable.auto.commit"), default=True)
-        self._pending_deletes = []
+        self._pending_deletes = {}
         if self.delete_after_consume and self.auto_commit:
             logger.warning(
                 "delete_after_consume with auto-commit enabled removes the S3 object before "
@@ -99,11 +99,42 @@ class S3Consumer:
         self.close()
         return False
 
-    def subscribe(self, topics):
+    def subscribe(self, topics, on_assign=None, on_revoke=None, on_lost=None):
         """
         Subscribes the consumer to a list of topics.
+
+        Rebalance callbacks are registered even when the caller supplies none:
+        partitions taken away from this consumer must drop their deferred S3
+        deletions, since another member will reprocess those messages.
         """
-        self.kafka_consumer.subscribe(topics)
+        self.kafka_consumer.subscribe(
+            topics,
+            on_assign=self._wrap_rebalance(on_assign),
+            on_revoke=self._wrap_rebalance(on_revoke, discard=True),
+            on_lost=self._wrap_rebalance(on_lost, discard=True),
+        )
+
+    def _wrap_rebalance(self, callback, discard=False):
+        def handler(consumer, partitions):
+            if discard:
+                self._discard_pending_deletes(partitions)
+            if callback:
+                callback(consumer, partitions)
+        return handler
+
+    def _discard_pending_deletes(self, partitions):
+        """
+        Forgets deletions for partitions this consumer no longer owns. Their
+        messages are uncommitted, so another member will consume them and must
+        still find the objects.
+        """
+        for part in partitions:
+            dropped = self._pending_deletes.pop((part.topic, part.partition), None)
+            if dropped:
+                logger.info(
+                    "Dropping %s deferred S3 deletion(s) for revoked %s[%s].",
+                    len(dropped), part.topic, part.partition,
+                )
 
     def commit(self, message=None, asynchronous=True):
         """
@@ -115,9 +146,11 @@ class S3Consumer:
         asynchronous commit has not reached the broker yet, so deleting on its
         return would remove the object while the offset can still be replayed.
         """
-        blocking = asynchronous and self._pending_deletes
-        if blocking:
-            logger.debug("Committing synchronously: %s S3 deletion(s) pending.", len(self._pending_deletes))
+        if asynchronous and self._pending_deletes:
+            logger.debug(
+                "Committing synchronously: %s partition(s) have S3 deletions pending.",
+                len(self._pending_deletes),
+            )
             asynchronous = False
 
         if message is None:
@@ -126,16 +159,36 @@ class S3Consumer:
             result = self.kafka_consumer.commit(message=message, asynchronous=asynchronous)
 
         if not asynchronous:
-            self._drain_pending_deletes()
+            self._drain_pending_deletes(message)
         return result
 
-    def _drain_pending_deletes(self):
+    def _drain_pending_deletes(self, message=None):
         """
         Deletes S3 objects whose offsets have now been committed.
+
+        A commit for one message only advances that partition up to that offset,
+        so it must not delete objects belonging to anything else still in flight.
         """
-        pending, self._pending_deletes = self._pending_deletes, []
-        for bucket, key in pending:
-            self._delete_object(bucket, key)
+        if message is None:
+            pending, self._pending_deletes = self._pending_deletes, {}
+            for entries in pending.values():
+                for _offset, bucket, key in entries:
+                    self._delete_object(bucket, key)
+            return
+
+        partition = (message.topic(), message.partition())
+        committed_through = message.offset()
+        entries = self._pending_deletes.get(partition, [])
+        keep = []
+        for offset, bucket, key in entries:
+            if offset <= committed_through:
+                self._delete_object(bucket, key)
+            else:
+                keep.append((offset, bucket, key))
+        if keep:
+            self._pending_deletes[partition] = keep
+        else:
+            self._pending_deletes.pop(partition, None)
 
     def _delete_object(self, bucket, key):
         try:
@@ -249,7 +302,9 @@ class S3Consumer:
             if self.auto_commit:
                 self._delete_object(s3_bucket, s3_key)
             else:
-                self._pending_deletes.append((s3_bucket, s3_key))
+                self._pending_deletes.setdefault((msg.topic(), msg.partition()), []).append(
+                    (msg.offset(), s3_bucket, s3_key)
+                )
 
         self._emit_metric("consume_success", topic=msg.topic(), bytes=len(body), s3_key=s3_key)
         return body

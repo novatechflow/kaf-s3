@@ -727,3 +727,103 @@ def test_non_deterministic_objects_are_still_deleted(mocker, consumer_config):
 
     S3Consumer(cfg).poll()
     mock_boto3.client.return_value.delete_object.assert_called_once()
+
+
+class _Partition:
+    def __init__(self, topic, partition):
+        self.topic = topic
+        self.partition = partition
+
+
+def _ref_msg(partition, offset, key, topic="t"):
+    m = _msg(json.dumps({"s3_bucket": "test-bucket", "s3_key": key}).encode("utf-8"))
+    m.topic.return_value = topic
+    m.partition.return_value = partition
+    m.offset.return_value = offset
+    return m
+
+
+def _deferred_delete_consumer(mocker, deleted):
+    mock_boto3 = mocker.patch("s3_connector.consumer.boto3")
+    mock_consumer_class = mocker.patch("s3_connector.consumer.Consumer")
+    mock_boto3.client.return_value.delete_object.side_effect = (
+        lambda **kw: deleted.append(kw["Key"])
+    )
+    response = {"ETag": '"etag"', "Body": MagicMock()}
+    response["Body"].read.return_value = b"payload"
+    mock_boto3.client.return_value.get_object.return_value = response
+
+    consumer = S3Consumer({
+        "kafka": {"bootstrap.servers": "x", "group.id": "g", "enable.auto.commit": False},
+        "s3": {"bucket": "test-bucket", "delete_after_consume": True, "require_integrity": False},
+    })
+    consumer.subscribe(["t"])
+    return consumer, mock_consumer_class
+
+
+def test_commit_of_one_message_only_deletes_up_to_its_offset(mocker):
+    """Committing one message does not advance other partitions or later offsets."""
+    deleted = []
+    consumer, mock_consumer_class = _deferred_delete_consumer(mocker, deleted)
+
+    for partition, offset, key in [(0, 10, "p0-o10"), (0, 11, "p0-o11"), (1, 5, "p1-o5")]:
+        mock_consumer_class.return_value.poll.return_value = _ref_msg(partition, offset, key)
+        consumer.poll()
+
+    consumer.commit(message=_ref_msg(0, 10, "p0-o10"))
+
+    assert deleted == ["p0-o10"]
+    assert {k: [e[0] for e in v] for k, v in consumer._pending_deletes.items()} == {
+        ("t", 0): [11], ("t", 1): [5],
+    }
+
+
+def test_revoked_partitions_drop_their_deferred_deletions(mocker):
+    """Another group member will reprocess those messages and needs the objects."""
+    deleted = []
+    consumer, mock_consumer_class = _deferred_delete_consumer(mocker, deleted)
+
+    for partition, offset, key in [(0, 10, "p0-obj"), (1, 5, "p1-obj")]:
+        mock_consumer_class.return_value.poll.return_value = _ref_msg(partition, offset, key)
+        consumer.poll()
+
+    on_revoke = mock_consumer_class.return_value.subscribe.call_args.kwargs["on_revoke"]
+    on_revoke(mock_consumer_class.return_value, [_Partition("t", 1)])
+    consumer.commit()
+
+    assert deleted == ["p0-obj"]
+
+
+def test_lost_partitions_also_drop_their_deletions(mocker):
+    deleted = []
+    consumer, mock_consumer_class = _deferred_delete_consumer(mocker, deleted)
+
+    mock_consumer_class.return_value.poll.return_value = _ref_msg(1, 5, "p1-obj")
+    consumer.poll()
+
+    on_lost = mock_consumer_class.return_value.subscribe.call_args.kwargs["on_lost"]
+    on_lost(mock_consumer_class.return_value, [_Partition("t", 1)])
+    consumer.commit()
+
+    assert deleted == []
+
+
+def test_user_rebalance_callbacks_are_still_invoked(mocker, consumer_config):
+    """Registering our own listeners must not take the hook away from callers."""
+    mocker.patch("s3_connector.consumer.boto3")
+    mock_consumer_class = mocker.patch("s3_connector.consumer.Consumer")
+
+    seen = []
+    consumer = S3Consumer(consumer_config)
+    consumer.subscribe(
+        ["t"],
+        on_assign=lambda c, p: seen.append("assign"),
+        on_revoke=lambda c, p: seen.append("revoke"),
+        on_lost=lambda c, p: seen.append("lost"),
+    )
+
+    kwargs = mock_consumer_class.return_value.subscribe.call_args.kwargs
+    for name in ("on_assign", "on_revoke", "on_lost"):
+        kwargs[name](mock_consumer_class.return_value, [])
+
+    assert seen == ["assign", "revoke", "lost"]
