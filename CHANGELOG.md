@@ -37,6 +37,12 @@ recommended mechanism by making them actually work.
 - README has a "Reclaiming S3 storage" section that recommends lifecycle rules, states
   `delete_after_consume`'s precondition plainly, and documents how deferred deletion
   behaves.
+- CI actions moved off Node 20, which GitHub is retiring: `actions/checkout` v4 to v5,
+  `actions/setup-python` v5 to v6, `azure/setup-helm` v4 to v5,
+  `softprops/action-gh-release` v2 to v3, `pypa/gh-action-pypi-publish` 1.9.0 to 1.14.2.
+- `ci.yml` declares `permissions: contents: read`; it was the only workflow inheriting the
+  repository's default token scope.
+- Added `.github/dependabot.yml` for grouped monthly action and pip updates.
 
 ## v1.8.1
 
