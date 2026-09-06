@@ -4,12 +4,21 @@ import hashlib
 import io
 import json
 import logging
-from confluent_kafka import Consumer, KafkaError, Producer
+from confluent_kafka import Consumer, KafkaError, KafkaException, Producer
 
 from .config import build_s3_client, split_kafka_config
 from .exceptions import DataIntegrityError
 
 logger = logging.getLogger(__name__)
+
+
+def _is_true(value):
+    """
+    Kafka config values may arrive as bools or as librdkafka-style strings.
+    """
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes")
+    return bool(value)
 
 class S3Consumer:
     def __init__(self, config):
@@ -34,6 +43,8 @@ class S3Consumer:
         self.delete_after_consume = self.s3_config.get("delete_after_consume", False)
         self.allow_inline_payloads = self.s3_config.get("allow_inline_payloads", True)
         self.expected_prefix = self.s3_config.get("prefix", "").rstrip("/")
+        if self.s3_config.get("prefix") and not self.expected_prefix:
+            raise ValueError("S3 prefix must contain more than '/'; prefix enforcement would be a no-op.")
         self.max_payload_bytes = self.s3_config.get("max_payload_bytes", 5 * 1024 * 1024 * 1024)
         self.require_integrity = self.s3_config.get("require_integrity", True)
         self.metric_callback = self.hooks.get("metrics")
@@ -43,6 +54,15 @@ class S3Consumer:
 
         if self.max_payload_bytes <= 0:
             raise ValueError("max_payload_bytes must be positive.")
+
+        self.auto_commit = _is_true(kafka_config.get("enable.auto.commit", True))
+        self._pending_deletes = []
+        if self.delete_after_consume and self.auto_commit:
+            logger.warning(
+                "delete_after_consume with auto-commit enabled removes the S3 object before "
+                "the payload is processed; a crash loses the record. Set "
+                "'enable.auto.commit': False and call commit() for at-least-once delivery."
+            )
 
     def close(self):
         """
@@ -69,12 +89,30 @@ class S3Consumer:
 
     def commit(self, message=None, asynchronous=True):
         """
-        Commits offsets. Use with 'enable.auto.commit': False for at-least-once
-        delivery, committing only after the payload has been processed.
+        Commits offsets, then deletes any S3 objects deferred by
+        delete_after_consume. Use with 'enable.auto.commit': False for
+        at-least-once delivery, committing only after the payload is processed.
         """
         if message is None:
-            return self.kafka_consumer.commit(asynchronous=asynchronous)
-        return self.kafka_consumer.commit(message=message, asynchronous=asynchronous)
+            result = self.kafka_consumer.commit(asynchronous=asynchronous)
+        else:
+            result = self.kafka_consumer.commit(message=message, asynchronous=asynchronous)
+        self._drain_pending_deletes()
+        return result
+
+    def _drain_pending_deletes(self):
+        """
+        Deletes S3 objects whose offsets have now been committed.
+        """
+        pending, self._pending_deletes = self._pending_deletes, []
+        for bucket, key in pending:
+            self._delete_object(bucket, key)
+
+    def _delete_object(self, bucket, key):
+        try:
+            self.s3_client.delete_object(Bucket=bucket, Key=key)
+        except Exception as exc:  # pragma: no cover - best-effort cleanup
+            logger.warning("Failed to delete S3 object %s after consume: %s", key, exc)
 
     def poll(self, timeout=1.0):
         """
@@ -94,7 +132,7 @@ class S3Consumer:
             if msg.error().code() == KafkaError._PARTITION_EOF:
                 return None
             else:
-                raise Exception(msg.error())
+                raise KafkaException(msg.error())
 
         raw_value = msg.value()
 
@@ -115,10 +153,12 @@ class S3Consumer:
 
         if s3_bucket != self.s3_bucket:
             raise self._integrity_error(
-                f"Unexpected S3 bucket in message: {s3_bucket}", ref_message
+                "unexpected_bucket", f"Unexpected S3 bucket in message: {s3_bucket}", ref_message
             )
         if self.expected_prefix and not s3_key.startswith(self.expected_prefix + "/"):
-            raise self._integrity_error(f"S3 key outside allowed prefix: {s3_key}", ref_message)
+            raise self._integrity_error(
+                "prefix_violation", f"S3 key outside allowed prefix: {s3_key}", ref_message
+            )
 
         expected_etag = ref_message.get("etag")
         expected_sha = ref_message.get("sha256")
@@ -126,11 +166,15 @@ class S3Consumer:
 
         if self.require_integrity and not (expected_etag or expected_sha):
             raise self._integrity_error(
-                f"Reference for {s3_key} carries no etag or sha256 to verify against", ref_message
+                "missing_checksum",
+                f"Reference for {s3_key} carries no etag or sha256 to verify against",
+                ref_message,
             )
         if compression not in (None, "gzip"):
             raise self._integrity_error(
-                f"Unsupported compression '{compression}' for S3 object {s3_key}", ref_message
+                "unsupported_compression",
+                f"Unsupported compression '{compression}' for S3 object {s3_key}",
+                ref_message,
             )
 
         response = self.s3_client.get_object(Bucket=s3_bucket, Key=s3_key)
@@ -141,23 +185,27 @@ class S3Consumer:
             if not actual_etag:
                 if self.require_integrity:
                     raise self._integrity_error(
-                        f"S3 object {s3_key} returned no ETag to verify", ref_message
+                        "missing_etag", f"S3 object {s3_key} returned no ETag to verify", ref_message
                     )
             elif actual_etag != expected_etag:
-                raise self._integrity_error(f"ETag check failed for S3 object {s3_key}", ref_message)
+                raise self._integrity_error(
+                    "etag_mismatch", f"ETag check failed for S3 object {s3_key}", ref_message
+                )
 
         body = self._decompress(stored, s3_key, ref_message) if compression == "gzip" else stored
 
         if expected_sha:
             actual_sha = hashlib.sha256(body).hexdigest()
             if actual_sha != expected_sha:
-                raise self._integrity_error(f"SHA-256 check failed for S3 object {s3_key}", ref_message)
+                raise self._integrity_error(
+                    "sha256_mismatch", f"SHA-256 check failed for S3 object {s3_key}", ref_message
+                )
 
         if self.delete_after_consume:
-            try:
-                self.s3_client.delete_object(Bucket=s3_bucket, Key=s3_key)
-            except Exception as exc:  # pragma: no cover - best-effort cleanup
-                logger.warning("Failed to delete S3 object %s after consume: %s", s3_key, exc)
+            if self.auto_commit:
+                self._delete_object(s3_bucket, s3_key)
+            else:
+                self._pending_deletes.append((s3_bucket, s3_key))
 
         self._emit_metric("consume_success", topic=msg.topic(), bytes=len(body), s3_key=s3_key)
         return body
@@ -184,7 +232,7 @@ class S3Consumer:
         data = body_stream.read(limit + 1)
         if len(data) > limit:
             raise self._integrity_error(
-                f"S3 object {s3_key} exceeds max_payload_bytes {limit}", ref_message
+                "object_too_large", f"S3 object {s3_key} exceeds max_payload_bytes {limit}", ref_message
             )
         return data
 
@@ -199,21 +247,26 @@ class S3Consumer:
                 body = gz.read(limit + 1)
         except (OSError, EOFError) as exc:
             raise self._integrity_error(
-                f"Failed to decompress S3 object {s3_key}: {exc}", ref_message
+                "decompression_failed", f"Failed to decompress S3 object {s3_key}: {exc}", ref_message
             )
         if len(body) > limit:
             raise self._integrity_error(
-                f"Decompressed S3 object {s3_key} exceeds max_payload_bytes {limit}", ref_message
+                "decompressed_too_large",
+                f"Decompressed S3 object {s3_key} exceeds max_payload_bytes {limit}",
+                ref_message,
             )
         return body
 
-    def _integrity_error(self, message, reference):
+    def _integrity_error(self, code, message, reference):
         """
         Builds a DataIntegrityError and mirrors it to the DLQ.
+
+        'code' is a fixed identifier safe to use as a metric label; the message
+        carries the S3 key and must never become one.
         """
         err = DataIntegrityError(message)
         self._send_dlq(error=str(err), reference=reference)
-        self._emit_metric("consume_integrity_error", reason=message)
+        self._emit_metric("consume_integrity_error", reason=code)
         return err
 
     def _skip(self, reason, topic=None, reference=None, raw=None):

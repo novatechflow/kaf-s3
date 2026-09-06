@@ -41,9 +41,17 @@ class MetricsRegistry:
             self._counters[key] = self._counters.get(key, 0) + value
 
     def render(self) -> str:
-        lines = []
         with self._lock:
-            for (name, labels), value in self._counters.items():
+            snapshot = list(self._counters.items())
+
+        families = {}
+        for (name, labels), value in snapshot:
+            families.setdefault(name, []).append((labels, value))
+
+        lines = []
+        for name in sorted(families):
+            lines.append(f"# TYPE {name} counter")
+            for labels, value in sorted(families[name]):
                 if labels:
                     label_str = ",".join(f'{k}="{escape_label_value(v)}"' for k, v in labels)
                     lines.append(f"{name}{{{label_str}}} {value}")

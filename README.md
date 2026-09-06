@@ -61,6 +61,8 @@ producer_config = {
         # "max_payload_bytes": 5 * 1024 * 1024 * 1024,  # hard cap on payload size
         # "prefix": "kafka/topic",         # prefix keys for organization/enforcement
         # "deterministic_keys": False,     # use payload hash for idempotent keys
+        # "multipart_threshold": 8388608,  # switch to multipart above this size;
+                                           #   S3 caps a single PUT at 5 GiB
         # "compression": "gzip",           # compress before S3 upload (gzip or None)
         # "ttl_seconds": 86400,            # writes a ttl_epoch object metadata hint;
                                            #   expiry itself requires an S3 lifecycle rule
@@ -84,12 +86,14 @@ consumer_config = {
         # Optional toggles
         # "max_inline_bytes": 900_000,     # inline small payloads on Kafka, offload larger ones
         # "max_payload_bytes": 5 * 1024 * 1024 * 1024,  # hard cap on payload size
-        # "delete_after_consume": False,   # delete object only after a successful integrity check
+        # "delete_after_consume": False,   # see "Deleting consumed objects" below
         # "allow_inline_payloads": True,   # allow non-reference payloads to pass through unchanged
         # "prefix": "kafka/topic",         # enforce prefix on incoming references
         # "require_integrity": True,       # reject references carrying no etag/sha256
         # "compression": "gzip",           # decompress automatically on consume
-        # "deterministic_keys": False,     # use payload hash for idempotent keys (producer)
+        # "deterministic_keys": False,     # use payload hash for idempotent keys
+        # "multipart_threshold": 8388608,  # switch to multipart above this size;
+                                           #   S3 caps a single PUT at 5 GiB (producer)
         # "ttl_seconds": 86400,            # hint TTL stored in object metadata (producer)
         # "server_side_encryption": "aws:kms", # SSE, optionally with KMS key below (producer)
         # "sse_kms_key_id": "<kms-key-id>",    # (producer)
@@ -164,6 +168,14 @@ consumer_config["hooks"] = {
 }
 ```
 
+### Deleting consumed objects
+
+`delete_after_consume` interacts with offset commits. Under auto-commit the object is
+deleted before `poll()` returns, so a crash between poll and processing loses the record
+from both Kafka and S3. With auto-commit disabled the deletion is deferred until
+`commit()`, and uncommitted deletions are dropped on `close()` — so the object always
+outlives the offset. Prefer the latter:
+
 For at-least-once delivery, disable auto-commit and commit after processing:
 
 ```python
@@ -236,7 +248,8 @@ Configuration is driven by env vars:
 
 ### Metrics
 - `/metrics` exposes Prometheus text format on `METRICS_PORT` (default 8000).
-- Only low-cardinality labels (`topic`, `partition`, `reason`) become series. Payload sizes are aggregated into `<event>_bytes` counters rather than one series per size, and S3 keys are never used as labels.
+- Only low-cardinality labels (`topic`, `partition`, `reason`) become series. Payload sizes are aggregated into `<event>_bytes` counters rather than one series per size, and S3 keys are never used as labels. `reason` is always a fixed code, never a formatted message.
+- Integrity reasons: `etag_mismatch`, `sha256_mismatch`, `missing_checksum`, `missing_etag`, `prefix_violation`, `unexpected_bucket`, `object_too_large`, `decompressed_too_large`, `decompression_failed`, `unsupported_compression`. Skip reasons: `tombstone`, `malformed_message`, `missing_key`.
 - The endpoint is unauthenticated. Keep it on an internal network, or bind it explicitly with `METRICS_ADDRESS`.
 - Sample Prometheus scrape config: `config/prometheus.yml`
 - Sample Grafana dashboard JSON: `config/grafana-dashboard.json`
@@ -255,6 +268,21 @@ helm upgrade --install kaf-s3 charts/kaf-s3-connector \
   --set env.KAFKA_GROUP_ID=my-group \
   --set env.S3_BUCKET=my-large-messages-bucket
 ```
+
+Kafka SASL/SSL passwords belong in a Secret, not in `values.env`, which renders into the
+Deployment in plain text:
+
+```bash
+kubectl create secret generic kaf-s3-kafka-credentials \
+  --from-literal=KAFKA_SASL_USERNAME=svc-kaf-s3 \
+  --from-literal=KAFKA_SASL_PASSWORD=...
+
+helm upgrade --install kaf-s3 charts/kaf-s3-connector \
+  --set 'envFrom[0].secretRef.name=kaf-s3-kafka-credentials'
+```
+
+The chart sets `prometheus.io/scrape` pod annotations; `config/prometheus.yml` includes a
+matching Kubernetes discovery job.
 
 ## Case Study
 

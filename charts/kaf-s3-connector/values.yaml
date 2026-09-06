@@ -9,6 +9,7 @@ service:
   type: ClusterIP
   port: 8000
 
+# Non-sensitive settings. Rendered into the Deployment in plain text.
 env:
   MODE: consumer
   TOPIC: large-messages-topic
@@ -16,6 +17,17 @@ env:
   KAFKA_GROUP_ID: my-s3-consumers
   S3_BUCKET: my-large-messages-bucket
   METRICS_PORT: "8000"
+
+# Secrets (KAFKA_SASL_PASSWORD, KAFKA_SSL_KEY_PASSWORD, ...) belong in a Secret,
+# not in values. List the Secret or ConfigMap names to load them from.
+envFrom: []
+  # - secretRef:
+  #     name: kaf-s3-kafka-credentials
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8000"
+  prometheus.io/path: /metrics
 
 podSecurityContext:
   runAsNonRoot: true

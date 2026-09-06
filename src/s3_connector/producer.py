@@ -1,6 +1,7 @@
 import boto3
 import gzip
 import hashlib
+import io
 import json
 import logging
 import time
@@ -10,6 +11,10 @@ from confluent_kafka import Producer
 from .config import build_s3_client, split_kafka_config
 
 logger = logging.getLogger(__name__)
+
+# S3 accepts at most 5 GiB in a single PUT; larger objects require multipart.
+SINGLE_PUT_LIMIT_BYTES = 5 * 1024 * 1024 * 1024
+DEFAULT_MULTIPART_THRESHOLD_BYTES = 8 * 1024 * 1024
 
 class S3Producer:
     def __init__(self, config):
@@ -33,11 +38,16 @@ class S3Producer:
         self.max_inline_bytes = self.s3_config.get("max_inline_bytes", 900_000)
         self.max_payload_bytes = self.s3_config.get("max_payload_bytes", 5 * 1024 * 1024 * 1024)
         self.s3_prefix = self.s3_config.get("prefix", "").rstrip("/")
+        if self.s3_config.get("prefix") and not self.s3_prefix:
+            raise ValueError("S3 prefix must contain more than '/'.")
         self.deterministic_keys = self.s3_config.get("deterministic_keys", False)
         self.ttl_seconds = self.s3_config.get("ttl_seconds")
         self.compression = self.s3_config.get("compression")
         self.sse = self.s3_config.get("server_side_encryption")
         self.sse_kms_key_id = self.s3_config.get("sse_kms_key_id")
+        self.multipart_threshold = self.s3_config.get(
+            "multipart_threshold", DEFAULT_MULTIPART_THRESHOLD_BYTES
+        )
         self.metric_callback = self.hooks.get("metrics")
 
         if self.max_inline_bytes < 0:
@@ -48,6 +58,14 @@ class S3Producer:
             raise ValueError("max_inline_bytes cannot exceed max_payload_bytes.")
         if self.compression not in (None, "gzip"):
             raise ValueError("Unsupported compression algorithm.")
+        if self.sse not in (None, "AES256", "aws:kms"):
+            raise ValueError("server_side_encryption must be 'AES256' or 'aws:kms'.")
+        if self.sse_kms_key_id and self.sse != "aws:kms":
+            raise ValueError("sse_kms_key_id requires server_side_encryption='aws:kms'.")
+        if not 0 < self.multipart_threshold <= SINGLE_PUT_LIMIT_BYTES:
+            raise ValueError(
+                f"multipart_threshold must be between 1 and {SINGLE_PUT_LIMIT_BYTES}."
+            )
 
     def produce(self, topic, payload, key=None):
         """
@@ -78,21 +96,7 @@ class S3Producer:
             payload_to_store = gzip.compress(payload)
             compression = "gzip"
 
-        put_kwargs = dict(
-            Bucket=self.s3_bucket,
-            Key=s3_key,
-            Body=payload_to_store
-        )
-        if self.ttl_seconds:
-            put_kwargs["Metadata"] = {"ttl_epoch": str(int(time.time()) + int(self.ttl_seconds))}
-        if self.sse:
-            put_kwargs["ServerSideEncryption"] = self.sse
-        if self.sse_kms_key_id:
-            put_kwargs["SSEKMSKeyId"] = self.sse_kms_key_id
-
-        response = self.s3_client.put_object(**put_kwargs)
-
-        etag = response.get("ETag", "").strip('"')
+        etag = self._upload(s3_key, payload_to_store)
         sha256 = hashlib.sha256(payload).hexdigest()
 
         reference_message = {
@@ -116,6 +120,41 @@ class S3Producer:
 
         self.kafka_producer.poll(0)
         self._emit_metric("produce_offloaded", topic=topic, bytes=payload_length, s3_key=s3_key)
+
+    def _object_kwargs(self):
+        """
+        Encryption and metadata options shared by both upload paths.
+        """
+        kwargs = {}
+        if self.ttl_seconds:
+            kwargs["Metadata"] = {"ttl_epoch": str(int(time.time()) + int(self.ttl_seconds))}
+        if self.sse:
+            kwargs["ServerSideEncryption"] = self.sse
+        if self.sse_kms_key_id:
+            kwargs["SSEKMSKeyId"] = self.sse_kms_key_id
+        return kwargs
+
+    def _upload(self, s3_key, body):
+        """
+        Uploads the stored bytes, switching to multipart above the threshold so
+        that objects larger than S3's single-PUT limit still succeed.
+
+        :return: The object ETag, or None for multipart uploads where the ETag
+                 is not a checksum of the content. SHA-256 covers those.
+        """
+        if len(body) <= self.multipart_threshold:
+            response = self.s3_client.put_object(
+                Bucket=self.s3_bucket, Key=s3_key, Body=body, **self._object_kwargs()
+            )
+            return response.get("ETag", "").strip('"')
+
+        self.s3_client.upload_fileobj(
+            io.BytesIO(body),
+            self.s3_bucket,
+            s3_key,
+            ExtraArgs=self._object_kwargs() or None,
+        )
+        return None
 
     def flush(self, timeout=30.0):
         """

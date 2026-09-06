@@ -430,3 +430,102 @@ def test_s3_client_uses_region_and_endpoint(mocker, consumer_config):
     mock_boto3.client.assert_called_once_with(
         "s3", region_name="eu-central-1", endpoint_url="https://minio.local:9000"
     )
+
+
+def test_integrity_error_metric_label_is_a_fixed_code(mocker, consumer_config):
+    """Error reasons must be stable codes, never the message containing the S3 key."""
+    mock_boto3 = mocker.patch("s3_connector.consumer.boto3")
+    mock_consumer_class = mocker.patch("s3_connector.consumer.Consumer")
+
+    events = []
+    cfg = json.loads(json.dumps(consumer_config))
+    cfg["hooks"] = {"metrics": lambda event, data: events.append((event, data))}
+
+    for i in range(25):
+        ref = {"s3_bucket": "test-bucket", "s3_key": f"uuid-{i}", "etag": "expected"}
+        mock_consumer_class.return_value.poll.return_value = _msg(
+            json.dumps(ref).encode("utf-8")
+        )
+        response = {"ETag": '"actual"', "Body": MagicMock()}
+        response["Body"].read.return_value = b"payload"
+        mock_boto3.client.return_value.get_object.return_value = response
+        with pytest.raises(DataIntegrityError):
+            S3Consumer(cfg).poll()
+
+    reasons = {data["reason"] for event, data in events if event == "consume_integrity_error"}
+    assert reasons == {"etag_mismatch"}
+
+
+def test_delete_is_deferred_until_commit_when_auto_commit_is_off(mocker, consumer_config):
+    """The object must outlive poll() so a crash before commit is recoverable."""
+    mock_boto3 = mocker.patch("s3_connector.consumer.boto3")
+    mock_consumer_class = mocker.patch("s3_connector.consumer.Consumer")
+
+    ref = {"s3_bucket": "test-bucket", "s3_key": "test-key"}
+    mock_consumer_class.return_value.poll.return_value = _msg(json.dumps(ref).encode("utf-8"))
+    response = {"ETag": '"etag"', "Body": MagicMock()}
+    response["Body"].read.return_value = b"payload"
+    mock_boto3.client.return_value.get_object.return_value = response
+
+    cfg = json.loads(json.dumps(consumer_config))
+    cfg["kafka"]["enable.auto.commit"] = False
+    cfg["s3"]["require_integrity"] = False
+    consumer = S3Consumer(cfg)
+
+    assert consumer.poll() == b"payload"
+    mock_boto3.client.return_value.delete_object.assert_not_called()
+
+    consumer.commit()
+    mock_boto3.client.return_value.delete_object.assert_called_once_with(
+        Bucket="test-bucket", Key="test-key"
+    )
+
+
+def test_uncommitted_deletes_are_dropped_on_close(mocker, consumer_config):
+    """Never delete an object whose offset was never committed."""
+    mock_boto3 = mocker.patch("s3_connector.consumer.boto3")
+    mock_consumer_class = mocker.patch("s3_connector.consumer.Consumer")
+
+    ref = {"s3_bucket": "test-bucket", "s3_key": "test-key"}
+    mock_consumer_class.return_value.poll.return_value = _msg(json.dumps(ref).encode("utf-8"))
+    response = {"ETag": '"etag"', "Body": MagicMock()}
+    response["Body"].read.return_value = b"payload"
+    mock_boto3.client.return_value.get_object.return_value = response
+
+    cfg = json.loads(json.dumps(consumer_config))
+    cfg["kafka"]["enable.auto.commit"] = "false"
+    cfg["s3"]["require_integrity"] = False
+    consumer = S3Consumer(cfg)
+    consumer.poll()
+    consumer.close()
+
+    mock_boto3.client.return_value.delete_object.assert_not_called()
+
+
+def test_kafka_errors_raise_kafka_exception(mocker, consumer_config):
+    """Broker errors surface as KafkaException, not a bare Exception."""
+    from confluent_kafka import KafkaException
+
+    mocker.patch("s3_connector.consumer.boto3")
+    mock_consumer_class = mocker.patch("s3_connector.consumer.Consumer")
+
+    error = MagicMock()
+    error.code.return_value = -1
+    kafka_msg = MagicMock()
+    kafka_msg.error.return_value = error
+    mock_consumer_class.return_value.poll.return_value = kafka_msg
+
+    consumer = S3Consumer(consumer_config)
+    with pytest.raises(KafkaException):
+        consumer.poll()
+
+
+def test_prefix_that_collapses_to_empty_is_rejected(mocker, consumer_config):
+    """A '/' prefix must not silently disable prefix enforcement."""
+    mocker.patch("s3_connector.consumer.boto3")
+    mocker.patch("s3_connector.consumer.Consumer")
+
+    cfg = json.loads(json.dumps(consumer_config))
+    cfg["s3"]["prefix"] = "/"
+    with pytest.raises(ValueError):
+        S3Consumer(cfg)
