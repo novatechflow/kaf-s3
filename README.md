@@ -251,17 +251,29 @@ if payload:
 
 ## Testing
 
-Install runtime deps and test tools:
+Unit tests mock Kafka and S3 and need nothing running:
 
 ```bash
-pip install -r requirements.txt pytest pytest-mock
-```
-
-Then run `pytest` from the project root:
-
-```bash
+pip install ".[test]"
 pytest
 ```
+
+Integration tests run the connector against a real Kafka broker and a real S3
+service, started as throwaway containers. They need Docker, are marked
+`integration`, and are excluded from the default run:
+
+```bash
+pip install ".[integration]"
+pytest -m integration
+```
+
+They exist because a mock encodes the same assumptions the code does, so it
+cannot catch a wrong one. Each test in `tests/integration/test_real_semantics.py`
+pins a behaviour that a released bug got wrong — multipart ETags are not content
+hashes, gzip embeds an mtime, librdkafka rejects unknown configuration keys,
+`produce()` raises `BufferError` under load — alongside end-to-end coverage of
+deferred deletion, rebalance handover, DLQ publication, tampering and missing
+objects. Without Docker, or without the extra installed, the suite skips.
 
 ## Docker & Operations
 
