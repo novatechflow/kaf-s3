@@ -650,3 +650,45 @@ def test_dlq_record_stays_within_the_size_cap(mocker, consumer_config, raw_size,
     record = mock_producer_class.return_value.produce.call_args.kwargs["value"]
     assert len(record) <= (cap or 512 * 1024)
     assert json.loads(record)["raw_truncated"] is True
+
+
+def _client_error(code, status=None):
+    from botocore.exceptions import ClientError
+    response = {"Error": {"Code": code, "Message": "boom"}}
+    if status is not None:
+        response["ResponseMetadata"] = {"HTTPStatusCode": status}
+    return ClientError(response, "GetObject")
+
+
+@pytest.mark.parametrize("code,status", [("NoSuchKey", 404), ("NoSuchVersion", None), ("Whatever", 404)])
+def test_missing_s3_object_is_skipped(mocker, consumer_config, code, status):
+    """A deleted or expired object must not take the consumer down."""
+    mock_boto3 = mocker.patch("s3_connector.consumer.boto3")
+    mock_consumer_class = mocker.patch("s3_connector.consumer.Consumer")
+
+    ref = {"s3_bucket": "test-bucket", "s3_key": "gone", "sha256": "x"}
+    mock_consumer_class.return_value.poll.return_value = _msg(json.dumps(ref).encode("utf-8"))
+    mock_boto3.client.return_value.get_object.side_effect = _client_error(code, status)
+
+    skips = []
+    cfg = json.loads(json.dumps(consumer_config))
+    cfg["hooks"] = {"skipped": lambda reason, data: skips.append(reason)}
+
+    assert S3Consumer(cfg).poll() is None
+    assert skips == ["object_missing"]
+
+
+@pytest.mark.parametrize("code", ["AccessDenied", "NoSuchBucket", "SlowDown", "InternalError"])
+def test_other_s3_errors_still_propagate(mocker, consumer_config, code):
+    """Credential, bucket and throttling failures are the caller's to handle."""
+    from botocore.exceptions import ClientError
+
+    mock_boto3 = mocker.patch("s3_connector.consumer.boto3")
+    mock_consumer_class = mocker.patch("s3_connector.consumer.Consumer")
+
+    ref = {"s3_bucket": "test-bucket", "s3_key": "k", "sha256": "x"}
+    mock_consumer_class.return_value.poll.return_value = _msg(json.dumps(ref).encode("utf-8"))
+    mock_boto3.client.return_value.get_object.side_effect = _client_error(code)
+
+    with pytest.raises(ClientError):
+        S3Consumer(consumer_config).poll()

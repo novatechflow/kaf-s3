@@ -14,10 +14,11 @@ spec:
     metadata:
       labels:
         app: {{ include "kaf-s3-connector.name" . }}
-      {{- with .Values.podAnnotations }}
       annotations:
+        prometheus.io/port: {{ .Values.service.port | quote }}
+        {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- end }}
     spec:
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
@@ -30,6 +31,8 @@ spec:
           ports:
             - containerPort: {{ .Values.service.port }}
           env:
+            - name: METRICS_PORT
+              value: {{ .Values.service.port | quote }}
             {{- range $key, $val := .Values.env }}
             - name: {{ $key }}
               value: "{{ $val }}"

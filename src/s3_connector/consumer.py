@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import logging
+from botocore.exceptions import ClientError
 from confluent_kafka import Consumer, KafkaError, KafkaException, Producer
 
 from .config import build_s3_client, parse_bool, require_bucket, split_kafka_config
@@ -13,6 +14,18 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DLQ_MAX_RAW_BYTES = 16 * 1024
 DEFAULT_DLQ_MAX_RECORD_BYTES = 512 * 1024
+MISSING_OBJECT_ERROR_CODES = ("NoSuchKey", "NoSuchVersion", "404")
+
+
+def _is_missing_object(exc):
+    """
+    True when S3 reports the object itself is gone, as opposed to a credential,
+    bucket or throttling error that the caller must see.
+    """
+    error = exc.response.get("Error", {})
+    if error.get("Code") in MISSING_OBJECT_ERROR_CODES:
+        return True
+    return exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 404
 
 
 def _is_reference(decoded):
@@ -193,7 +206,15 @@ class S3Consumer:
                 ref_message,
             )
 
-        response = self.s3_client.get_object(Bucket=s3_bucket, Key=s3_key)
+        try:
+            response = self.s3_client.get_object(Bucket=s3_bucket, Key=s3_key)
+        except ClientError as exc:
+            if not _is_missing_object(exc):
+                raise
+            # An object can legitimately be gone: a TTL lifecycle rule fired, another
+            # consumer group deleted it, or an auto-committed message is being replayed.
+            return self._skip("object_missing", topic=msg.topic(), reference=ref_message)
+
         self._check_content_length(response.get("ContentLength"), s3_key, ref_message)
         stored = self._read_capped(response["Body"], s3_key, ref_message)
 
