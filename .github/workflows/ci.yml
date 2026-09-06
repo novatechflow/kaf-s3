@@ -42,7 +42,7 @@ jobs:
       - name: Install deps
         run: pip install ".[integration]"
       - name: Run integration tests
-        run: pytest -m integration -v
+        run: pytest -m integration -v --tb=short -ra
 
   image:
     runs-on: ubuntu-latest

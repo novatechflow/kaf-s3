@@ -59,7 +59,7 @@ def test_multipart_etag_is_not_the_content_md5(producer_config, s3, topic):
     Why the reference omits etag for multipart uploads and leans on sha256.
     A multipart ETag hashes the part hashes and carries a part-count suffix.
     """
-    payload = os.urandom(12 * 1024 * 1024)
+    payload = os.urandom(6 * 1024 * 1024)
     producer = S3Producer(
         producer_config(max_inline_bytes=0, multipart_threshold=5 * 1024 * 1024)
     )

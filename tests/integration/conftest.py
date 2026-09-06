@@ -61,7 +61,13 @@ def s3_endpoint():
     import boto3
     from testcontainers.community.minio import MinioContainer
 
-    with MinioContainer() as container:
+    # MinIO answers SSE-S3 (AES256) only when a KMS key is configured; without one
+    # it returns NotImplemented, which would look like a connector bug.
+    container = MinioContainer().with_env(
+        "MINIO_KMS_SECRET_KEY",
+        "kaf-s3-test-key:MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDA=",
+    )
+    with container:
         config = container.get_config()
         os.environ["AWS_ACCESS_KEY_ID"] = config["access_key"]
         os.environ["AWS_SECRET_ACCESS_KEY"] = config["secret_key"]

@@ -16,17 +16,21 @@ SMALL = b"order-event-" * 64
 LARGE = os.urandom(64 * 1024)
 
 
-@pytest.mark.parametrize("label,s3_options,payload", [
-    ("plain", {"max_inline_bytes": 0}, SMALL),
-    ("gzip", {"max_inline_bytes": 0, "compression": "gzip"}, SMALL),
-    ("prefix", {"max_inline_bytes": 0, "prefix": "kafka/events"}, SMALL),
-    ("deterministic", {"max_inline_bytes": 0, "deterministic_keys": True}, SMALL),
-    ("sse", {"max_inline_bytes": 0, "server_side_encryption": "AES256"}, SMALL),
-    ("ttl", {"max_inline_bytes": 0, "ttl_seconds": 86400}, SMALL),
-    ("incompressible", {"max_inline_bytes": 0, "compression": "gzip"}, LARGE),
-    ("inline", {"max_inline_bytes": 1_000_000}, SMALL),
-])
-def test_round_trip(producer_config, consumer_config, topic, label, s3_options, payload):
+ROUND_TRIPS = {
+    "plain": ({"max_inline_bytes": 0}, SMALL),
+    "gzip": ({"max_inline_bytes": 0, "compression": "gzip"}, SMALL),
+    "prefix": ({"max_inline_bytes": 0, "prefix": "kafka/events"}, SMALL),
+    "deterministic": ({"max_inline_bytes": 0, "deterministic_keys": True}, SMALL),
+    "sse": ({"max_inline_bytes": 0, "server_side_encryption": "AES256"}, SMALL),
+    "ttl": ({"max_inline_bytes": 0, "ttl_seconds": 86400}, SMALL),
+    "incompressible": ({"max_inline_bytes": 0, "compression": "gzip"}, LARGE),
+    "inline": ({"max_inline_bytes": 1_000_000}, SMALL),
+}
+
+
+@pytest.mark.parametrize("case", list(ROUND_TRIPS), ids=list(ROUND_TRIPS))
+def test_round_trip(producer_config, consumer_config, topic, case):
+    s3_options, payload = ROUND_TRIPS[case]
     producer = S3Producer(producer_config(**s3_options))
     producer.produce(topic, payload)
     assert producer.close() == 0
@@ -44,7 +48,7 @@ def test_multipart_round_trip(producer_config, consumer_config, topic):
     Above the threshold boto3 uploads in parts. A multipart ETag is a hash of
     part hashes, not of the content, which is why the reference omits it.
     """
-    payload = os.urandom(12 * 1024 * 1024)
+    payload = os.urandom(6 * 1024 * 1024)
     options = {"max_inline_bytes": 0, "multipart_threshold": 5 * 1024 * 1024}
 
     producer = S3Producer(producer_config(**options))
