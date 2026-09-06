@@ -159,7 +159,12 @@ def _run_producer(config, topic, registry):
     producer = S3Producer(config)
     try:
         for line in iter(sys.stdin.buffer.readline, b""):
-            payload = line.rstrip(b"\n")
+            payload = line.rstrip(b"\r\n")
+            if not payload:
+                # An empty value is a tombstone on a compacted topic, never what a
+                # blank line in a pipe meant.
+                registry.inc("stdin_blank_lines")
+                continue
             producer.produce(topic, payload)
             registry.inc("stdin_lines")
     finally:

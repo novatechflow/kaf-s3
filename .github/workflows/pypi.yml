@@ -23,7 +23,14 @@ jobs:
       - name: Get version from tag
         id: get_version
         run: |
-          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          TAG_NAME="${{ github.event.release.tag_name }}"
+          if [ -z "$TAG_NAME" ] && [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            TAG_NAME="${GITHUB_REF#refs/tags/}"
+          fi
+          if [ -z "$TAG_NAME" ]; then
+            echo "This workflow publishes a tagged release. Run it from a tag, not ${GITHUB_REF}."
+            exit 1
+          fi
           VERSION="${TAG_NAME#v}"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Building version: $VERSION"
