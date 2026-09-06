@@ -827,3 +827,14 @@ def test_user_rebalance_callbacks_are_still_invoked(mocker, consumer_config):
         kwargs[name](mock_consumer_class.return_value, [])
 
     assert seen == ["assign", "revoke", "lost"]
+
+
+def test_bucket_with_surrounding_whitespace_is_rejected(mocker):
+    """A padded name passes to S3 verbatim and fails there with a worse message."""
+    mocker.patch("s3_connector.consumer.boto3")
+    mocker.patch("s3_connector.consumer.Consumer")
+    with pytest.raises(ValueError, match="whitespace"):
+        S3Consumer({
+            "kafka": {"bootstrap.servers": "x", "group.id": "g"},
+            "s3": {"bucket": " my-bucket "},
+        })

@@ -186,3 +186,24 @@ def test_consumer_loop_does_not_commit_an_empty_poll(mocker):
     _run_consumer({}, "topic", MetricsRegistry())
 
     consumer.commit.assert_not_called()
+
+
+def test_stdin_producer_skips_blank_lines(mocker):
+    """An empty value is a tombstone on a compacted topic, not a blank line."""
+    import io
+    import sys as _sys
+    from s3_connector.runtime import _run_producer
+
+    produced = []
+    producer = mocker.MagicMock()
+    producer.produce.side_effect = lambda topic, payload: produced.append(payload)
+    mocker.patch("s3_connector.runtime.S3Producer", return_value=producer)
+    mocker.patch.object(_sys, "stdin", mocker.MagicMock(buffer=io.BytesIO(b"one\n\nthree\r\n")))
+
+    registry = MetricsRegistry()
+    _run_producer({}, "topic", registry)
+
+    assert produced == [b"one", b"three"]
+    assert "stdin_lines 2" in registry.render()
+    assert "stdin_blank_lines 1" in registry.render()
+    producer.close.assert_called_once()

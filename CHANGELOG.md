@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.8.1
+
+### Fixed
+- The PyPI workflow's `workflow_dispatch` trigger could not build. It derived the version
+  with `${GITHUB_REF#refs/tags/}`, which on a branch leaves the ref intact, so the build
+  ran with `SETUPTOOLS_SCM_PRETEND_VERSION=refs/heads/main` and died on
+  `InvalidVersion`. It now reads the release tag, falls back to the ref only when that ref
+  is a tag, and exits with a clear message otherwise. The same class of bug was fixed in
+  the Docker workflow in v1.3.0; the shell logic for both is now covered by tests.
+- Stdin producer mode turned blank lines into empty Kafka messages, which are delete
+  markers on a compacted topic. Blank lines are skipped and counted as
+  `stdin_blank_lines`, and `\r\n` line endings are handled.
+- A bucket name with leading or trailing whitespace passed validation and was sent to S3
+  verbatim, failing later with a less obvious error. It is now rejected at construction.
+- `examples/produce_example.py` flushed twice on shutdown, once explicitly and again via
+  `close()`, blocking for up to 60 seconds. `close()` alone reports what it flushed.
+
 ## v1.8.0
 
 ### Fixed

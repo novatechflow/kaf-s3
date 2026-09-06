@@ -42,6 +42,8 @@ def require_bucket(s3_config):
     bucket = s3_config.get("bucket")
     if not isinstance(bucket, str) or not bucket.strip():
         raise ValueError("S3 bucket must be specified in the configuration.")
+    if bucket != bucket.strip():
+        raise ValueError("S3 bucket must not have leading or trailing whitespace.")
     return bucket
 
 

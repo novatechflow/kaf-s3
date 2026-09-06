@@ -34,18 +34,18 @@ def main():
         print(f"Producing message from '{file_path}' to topic '{topic}'...")
         producer.produce(topic=topic, payload=payload)
 
-        undelivered = producer.flush(timeout=30.0)
-        if undelivered:
-            print(f"{undelivered} message(s) could not be delivered.")
-        else:
-            print("Message produced and delivered successfully.")
+        print("Message queued; flushing before exit.")
 
     except FileNotFoundError:
         print(f"Error: The file '{file_path}' was not found.")
     except Exception as e:
         print(f"An error occurred: {e}")
     finally:
-        producer.close()
+        undelivered = producer.close(timeout=30.0)
+        if undelivered:
+            print(f"{undelivered} message(s) could not be delivered.")
+        else:
+            print("Message delivered successfully.")
 
 if __name__ == "__main__":
     main()
