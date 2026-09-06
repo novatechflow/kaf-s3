@@ -102,7 +102,10 @@ class S3Producer:
         payload_to_store = payload
         compression = None
         if self.compression == "gzip":
-            payload_to_store = gzip.compress(payload)
+            # mtime=0 keeps the output byte-identical for identical input. The default
+            # embeds a timestamp, which would give the same deterministic key a
+            # different ETag on every produce.
+            payload_to_store = gzip.compress(payload, mtime=0)
             compression = "gzip"
 
         etag = self._upload(s3_key, payload_to_store)
@@ -115,6 +118,10 @@ class S3Producer:
             "sha256": sha256,
             "compression": compression,
         }
+        if self.deterministic_keys:
+            # Marks the object as potentially shared with other messages, so a
+            # consumer with delete_after_consume does not remove it from under them.
+            reference_message["deterministic"] = True
 
         try:
             self._produce(

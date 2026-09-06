@@ -11,7 +11,7 @@
   "title": "kaf-s3-connector",
   "uid": "kaf-s3-connector",
   "schemaVersion": 39,
-  "version": 2,
+  "version": 3,
   "editable": true,
   "refresh": "30s",
   "time": {
@@ -410,6 +410,54 @@
           "refId": "B",
           "expr": "sum (rate(produce_error[$__rate_interval]))",
           "legendFormat": "delivery failed",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 8,
+      "title": "Producer backpressure",
+      "description": "produce_queue_full means librdkafka's local queue stayed full for the whole produce_timeout and the message was rejected. Sustained non-zero means the brokers cannot keep up.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (topic) (rate(produce_queue_full[$__rate_interval]))",
+          "legendFormat": "queue full - {{topic}}",
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
