@@ -25,11 +25,24 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install deps
-        run: |
-          pip install -r requirements.txt pytest pytest-mock
-          pip install .
+        run: pip install ".[test]"
       - name: Run tests
         run: pytest
+
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: pip install ".[integration]"
+      - name: Run integration tests
+        run: pytest -m integration -v
 
   image:
     runs-on: ubuntu-latest

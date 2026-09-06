@@ -25,6 +25,17 @@ dependencies = [
     "confluent-kafka>=1.8.2",
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest>=7",
+    "pytest-mock>=3",
+]
+integration = [
+    "pytest>=7",
+    "pytest-mock>=3",
+    "testcontainers[kafka,minio]>=4.8",
+]
+
 [project.scripts]
 kaf-s3-connector = "s3_connector.runtime:run"
 
@@ -41,3 +52,12 @@ where = ["src"]
 version_file = "src/s3_connector/_version.py"
 fallback_version = "0.0.0"
 local_scheme = "no-local-version"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: needs Docker; runs against a real Kafka broker and a real S3 service",
+]
+# Integration tests are opt-in so the default run stays fast and Docker-free.
+# Run them with: pytest -m integration
+addopts = "-m 'not integration'"
