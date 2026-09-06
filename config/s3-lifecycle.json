@@ -1,0 +1,26 @@
+{
+  "Rules": [
+    {
+      "ID": "kaf-s3-expire-offloaded-payloads",
+      "Status": "Enabled",
+      "Filter": {
+        "Tag": { "Key": "kaf-s3-ttl-seconds", "Value": "86400" }
+      },
+      "Expiration": { "Days": 1 }
+    },
+    {
+      "ID": "kaf-s3-expire-by-prefix",
+      "Status": "Disabled",
+      "Filter": {
+        "Prefix": "kafka/large-messages-topic/"
+      },
+      "Expiration": { "Days": 7 }
+    },
+    {
+      "ID": "kaf-s3-abort-incomplete-multipart-uploads",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "" },
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 1 }
+    }
+  ]
+}

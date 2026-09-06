@@ -16,7 +16,7 @@ This library provides a custom Kafka Producer and Consumer that automatically ha
 -   **Data Integrity:** Verifies every S3 object against the ETag and SHA-256 carried in the reference. References without a verifiable checksum are rejected by default (`require_integrity`).
 -   **Secure by Default:** Leverages AWS IAM roles and the default `boto3` credential chain, avoiding the need to hardcode secrets.
 -   **Flexible Configuration:** Built on top of `confluent-kafka-python`, allowing for full customization of Kafka client settings, including SASL and SSL.
--   **Operational Ready:** DLQ support, Prometheus `/metrics`, Helm chart, non-root image, optional compression, TTL hints, SSE-KMS.
+-   **Operational Ready:** DLQ support, Prometheus `/metrics`, Helm chart, non-root image, optional compression, lifecycle-rule TTL tagging, SSE-KMS.
 -   **Bounded Resources:** `max_payload_bytes` caps both the download and the gzip expansion, so a small object cannot inflate into an unbounded allocation.
 
 ## Installation
@@ -72,8 +72,8 @@ producer_config = {
         # "produce_timeout": 30.0,         # how long to apply backpressure when
                                            #   librdkafka's local queue is full
         # "compression": "gzip",           # compress before S3 upload (gzip or None)
-        # "ttl_seconds": 86400,            # writes a ttl_epoch object metadata hint;
-                                           #   expiry itself requires an S3 lifecycle rule
+        # "ttl_seconds": 86400,            # tags the object kaf-s3-ttl-seconds=<n> so an
+                                           #   S3 lifecycle rule can expire it
         # "server_side_encryption": "aws:kms", # SSE, optionally with KMS key below
         # "sse_kms_key_id": "<kms-key-id>",
         # "region_name": "eu-central-1",   # otherwise the boto3 default chain applies
@@ -94,7 +94,8 @@ consumer_config = {
         # Optional toggles
         # "max_inline_bytes": 900_000,     # inline small payloads on Kafka, offload larger ones
         # "max_payload_bytes": 5 * 1024 * 1024 * 1024,  # hard cap on payload size
-        # "delete_after_consume": False,   # see "Deleting consumed objects" below
+        # "delete_after_consume": False,   # single-consumer-group only; needs manual
+                                           #   commits. See "Reclaiming S3 storage"
         # "allow_inline_payloads": True,   # allow non-reference payloads to pass through unchanged
         # "dlq_max_raw_bytes": 16384,      # raw bytes echoed into a DLQ record
         # "dlq_max_record_bytes": 524288,  # hard cap on the encoded DLQ record
@@ -108,7 +109,7 @@ consumer_config = {
                                            #   S3 caps a single PUT at 5 GiB
         # "produce_timeout": 30.0,         # how long to apply backpressure when
                                            #   librdkafka's local queue is full (producer)
-        # "ttl_seconds": 86400,            # hint TTL stored in object metadata (producer)
+        # "ttl_seconds": 86400,            # tags objects for an S3 lifecycle rule (producer)
         # "server_side_encryption": "aws:kms", # SSE, optionally with KMS key below (producer)
         # "sse_kms_key_id": "<kms-key-id>",    # (producer)
     }
@@ -188,20 +189,54 @@ consumer_config["hooks"] = {
 A connector instance is not safe to share across threads. Give each thread its own
 `S3Producer` or `S3Consumer`, which is also what `confluent-kafka` expects for consumers.
 
-### Deleting consumed objects
+### Reclaiming S3 storage
 
-Deferred deletions are tracked per partition and offset: `commit(message=...)` deletes
-only what that commit covers, and partitions lost to a rebalance drop their pending
-deletions so the member that takes them over still finds the objects.
+Offloaded objects outlive the Kafka messages that reference them, so something has to
+remove them. There are two mechanisms, and they are not equivalent.
 
-Objects written with `deterministic_keys` are never deleted on consume: deduplication
-means several messages can reference one object, so removing it would strand the rest.
+**S3 lifecycle rules (recommended).** Expiry belongs to the bucket, not to a consumer. A
+rule works no matter how many consumer groups read the topic, keeps working when a
+consumer is down, and costs nothing at runtime. Set `ttl_seconds` on the producer and the
+object is tagged `kaf-s3-ttl-seconds=<n>`; lifecycle rules can filter on tags, so a rule
+can then expire it. `config/s3-lifecycle.json` is ready to apply:
 
-`delete_after_consume` interacts with offset commits. Under auto-commit the object is
-deleted before `poll()` returns, so a crash between poll and processing loses the record
-from both Kafka and S3. With auto-commit disabled the deletion is deferred until
-`commit()`, and uncommitted deletions are dropped on `close()` — so the object always
-outlives the offset. Prefer the latter:
+```bash
+aws s3api put-bucket-lifecycle-configuration \
+  --bucket my-large-messages-bucket \
+  --lifecycle-configuration file://config/s3-lifecycle.json
+```
+
+Set the expiry longer than the topic's retention, or a consumer that falls behind will
+find its objects gone. S3 expiry is day-granular, so objects live a little past their TTL.
+The file also carries a prefix-based rule and an `AbortIncompleteMultipartUpload` rule,
+which is worth enabling on any bucket this library writes to.
+
+**`delete_after_consume` (narrow).** Deletes each object once its message is consumed.
+It reclaims storage immediately rather than a day later, which matters at high volume,
+but it is **only correct when exactly one consumer group reads the topic**. Kafka is a
+fan-out log: any other group still needing that object loses the message, and no consumer
+can detect that another group exists. The connector logs a warning at startup, and that
+is the most it can do.
+
+It also requires `enable.auto.commit: False` and is refused otherwise — under auto-commit
+the object is removed before the payload is processed, so a crash loses the record.
+
+Given a choice, prefer the lifecycle rule.
+
+#### How deferred deletion behaves
+
+Deletion waits for the commit that makes the offset durable, so the object always outlives
+the offset:
+
+- deletions are tracked per partition and offset, so `commit(message=...)` deletes only
+  what that commit covers;
+- a commit with deletions pending is forced synchronous, since an asynchronous commit has
+  not reached the broker yet;
+- partitions lost to a rebalance drop their pending deletions, so the member that takes
+  them over still finds the objects;
+- objects written with `deterministic_keys` are never deleted, because deduplication means
+  several messages can reference one object;
+- `close()` drops anything uncommitted rather than deleting it.
 
 For at-least-once delivery, disable auto-commit and commit after processing:
 
@@ -283,6 +318,7 @@ Configuration is driven by env vars:
 - The endpoint is unauthenticated. Keep it on an internal network, or bind it explicitly with `METRICS_ADDRESS`.
 - Sample Prometheus scrape config: `config/prometheus.yml`
 - Sample Grafana dashboard JSON: `config/grafana-dashboard.json`
+- Sample S3 lifecycle policy: `config/s3-lifecycle.json`
 
 ### Helm
 - Chart: `charts/kaf-s3-connector`

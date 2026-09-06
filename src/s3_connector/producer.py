@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import time
+import urllib.parse
 import uuid
 from confluent_kafka import Producer
 
@@ -70,6 +71,8 @@ class S3Producer:
             )
         if self.produce_timeout < 0:
             raise ValueError("produce_timeout must be non-negative.")
+        if self.ttl_seconds is not None and int(self.ttl_seconds) <= 0:
+            raise ValueError("ttl_seconds must be positive.")
 
     def produce(self, topic, payload, key=None):
         """
@@ -163,7 +166,13 @@ class S3Producer:
         """
         kwargs = {}
         if self.ttl_seconds:
+            # S3 lifecycle rules can filter on tags but not on user metadata, so the
+            # tag is what actually lets a rule expire these objects. The metadata is
+            # kept as a human-readable record of the intended expiry.
             kwargs["Metadata"] = {"ttl_epoch": str(int(time.time()) + int(self.ttl_seconds))}
+            kwargs["Tagging"] = urllib.parse.urlencode(
+                {"kaf-s3-ttl-seconds": str(int(self.ttl_seconds))}
+            )
         if self.sse:
             kwargs["ServerSideEncryption"] = self.sse
         if self.sse_kms_key_id:
