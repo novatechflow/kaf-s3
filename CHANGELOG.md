@@ -1,5 +1,24 @@
 # Changelog
 
+## v1.7.0
+
+### Fixed
+- `deterministic_keys` combined with `compression: "gzip"` rejected valid messages.
+  `gzip.compress` embeds an mtime, so re-producing an identical payload wrote different
+  bytes to the same key; any earlier message still referencing it then failed its ETag
+  check and was rejected as corrupt. Compression is now byte-reproducible (`mtime=0`).
+- `deterministic_keys` combined with `delete_after_consume` silently lost messages.
+  Deduplicated messages share one object, so consuming the first deleted it and every
+  other message pointing at it was skipped as `object_missing` — a loss made silent by
+  the v1.6.0 change that stopped missing objects from raising. Producers now mark such
+  references `deterministic`, and consumers do not delete objects that carry the mark.
+
+### Changed
+- Added a producer backpressure panel to the Grafana dashboard. `produce_queue_full` was
+  emitted from v1.6.0 but had nowhere to show; every metric the code emits is now on the
+  dashboard.
+- Documented that a connector instance is not safe to share across threads.
+
 ## v1.6.0
 
 ### Fixed

@@ -692,3 +692,38 @@ def test_other_s3_errors_still_propagate(mocker, consumer_config, code):
 
     with pytest.raises(ClientError):
         S3Consumer(consumer_config).poll()
+
+
+def test_deterministic_objects_are_not_deleted(mocker, consumer_config):
+    """A shared object must outlive the first message that references it."""
+    mock_boto3 = mocker.patch("s3_connector.consumer.boto3")
+    mock_consumer_class = mocker.patch("s3_connector.consumer.Consumer")
+
+    ref = {"s3_bucket": "test-bucket", "s3_key": "shared", "deterministic": True}
+    mock_consumer_class.return_value.poll.return_value = _msg(json.dumps(ref).encode("utf-8"))
+    response = {"ETag": '"etag"', "Body": MagicMock()}
+    response["Body"].read.return_value = b"payload"
+    mock_boto3.client.return_value.get_object.return_value = response
+
+    cfg = json.loads(json.dumps(consumer_config))
+    cfg["s3"]["require_integrity"] = False
+
+    assert S3Consumer(cfg).poll() == b"payload"
+    mock_boto3.client.return_value.delete_object.assert_not_called()
+
+
+def test_non_deterministic_objects_are_still_deleted(mocker, consumer_config):
+    mock_boto3 = mocker.patch("s3_connector.consumer.boto3")
+    mock_consumer_class = mocker.patch("s3_connector.consumer.Consumer")
+
+    ref = {"s3_bucket": "test-bucket", "s3_key": "unique"}
+    mock_consumer_class.return_value.poll.return_value = _msg(json.dumps(ref).encode("utf-8"))
+    response = {"ETag": '"etag"', "Body": MagicMock()}
+    response["Body"].read.return_value = b"payload"
+    mock_boto3.client.return_value.get_object.return_value = response
+
+    cfg = json.loads(json.dumps(consumer_config))
+    cfg["s3"]["require_integrity"] = False
+
+    S3Consumer(cfg).poll()
+    mock_boto3.client.return_value.delete_object.assert_called_once()

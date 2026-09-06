@@ -64,7 +64,9 @@ producer_config = {
         # "max_inline_bytes": 900_000,     # inline small payloads on Kafka, offload larger ones
         # "max_payload_bytes": 5 * 1024 * 1024 * 1024,  # hard cap on payload size
         # "prefix": "kafka/topic",         # prefix keys for organization/enforcement
-        # "deterministic_keys": False,     # use payload hash for idempotent keys
+        # "deterministic_keys": False,     # use payload hash for idempotent keys;
+                                           #   marks references so consumers with
+                                           #   delete_after_consume leave them alone
         # "multipart_threshold": 8388608,  # switch to multipart above this size;
                                            #   S3 caps a single PUT at 5 GiB
         # "produce_timeout": 30.0,         # how long to apply backpressure when
@@ -99,7 +101,9 @@ consumer_config = {
         # "prefix": "kafka/topic",         # enforce prefix on incoming references
         # "require_integrity": True,       # reject references carrying no etag/sha256
         # "compression": "gzip",           # decompress automatically on consume
-        # "deterministic_keys": False,     # use payload hash for idempotent keys
+        # "deterministic_keys": False,     # use payload hash for idempotent keys;
+                                           #   marks references so consumers with
+                                           #   delete_after_consume leave them alone
         # "multipart_threshold": 8388608,  # switch to multipart above this size;
                                            #   S3 caps a single PUT at 5 GiB
         # "produce_timeout": 30.0,         # how long to apply backpressure when
@@ -178,7 +182,15 @@ consumer_config["hooks"] = {
 }
 ```
 
+### Threads
+
+A connector instance is not safe to share across threads. Give each thread its own
+`S3Producer` or `S3Consumer`, which is also what `confluent-kafka` expects for consumers.
+
 ### Deleting consumed objects
+
+Objects written with `deterministic_keys` are never deleted on consume: deduplication
+means several messages can reference one object, so removing it would strand the rest.
 
 `delete_after_consume` interacts with offset commits. Under auto-commit the object is
 deleted before `poll()` returns, so a crash between poll and processing loses the record

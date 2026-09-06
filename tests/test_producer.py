@@ -455,3 +455,45 @@ def test_inline_delivery_failures_are_reported(mocker):
     S3Producer(cfg).produce("topic", b"small")
 
     assert "produce_error" in events
+
+
+def test_gzip_output_is_reproducible(mocker):
+    """gzip embeds an mtime by default, which would give one deterministic key
+    a different ETag on every produce."""
+    import time as _time
+
+    mock_boto3 = mocker.patch("s3_connector.producer.boto3")
+    mocker.patch("s3_connector.producer.Producer")
+    mock_boto3.client.return_value.put_object.return_value = {"ETag": '"e"'}
+
+    cfg = {
+        "kafka": {"bootstrap.servers": "mock:9092"},
+        "s3": {"bucket": "b", "max_inline_bytes": 0, "compression": "gzip",
+               "deterministic_keys": True},
+    }
+    producer = S3Producer(cfg)
+    payload = b"invoice" * 500
+
+    producer.produce("topic", payload)
+    first = mock_boto3.client.return_value.put_object.call_args.kwargs["Body"]
+    _time.sleep(1.1)
+    producer.produce("topic", payload)
+    second = mock_boto3.client.return_value.put_object.call_args.kwargs["Body"]
+
+    assert first == second
+
+
+def test_deterministic_references_are_marked(mocker):
+    """Consumers need to know an object may be shared before deleting it."""
+    mock_boto3 = mocker.patch("s3_connector.producer.boto3")
+    mock_kafka_producer_class = mocker.patch("s3_connector.producer.Producer")
+    mock_boto3.client.return_value.put_object.return_value = {"ETag": '"e"'}
+
+    for deterministic, expected in [(True, True), (False, None)]:
+        cfg = {
+            "kafka": {"bootstrap.servers": "mock:9092"},
+            "s3": {"bucket": "b", "max_inline_bytes": 0, "deterministic_keys": deterministic},
+        }
+        S3Producer(cfg).produce("topic", b"payload" * 100)
+        ref = json.loads(mock_kafka_producer_class.return_value.produce.call_args.kwargs["value"])
+        assert ref.get("deterministic") is expected

@@ -239,7 +239,13 @@ class S3Consumer:
                     "sha256_mismatch", f"SHA-256 check failed for S3 object {s3_key}", ref_message
                 )
 
-        if self.delete_after_consume:
+        if self.delete_after_consume and ref_message.get("deterministic"):
+            logger.debug(
+                "Not deleting %s: the reference is marked deterministic and other "
+                "messages may point at the same object.",
+                s3_key,
+            )
+        elif self.delete_after_consume:
             if self.auto_commit:
                 self._delete_object(s3_bucket, s3_key)
             else:
