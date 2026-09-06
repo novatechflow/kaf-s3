@@ -1,5 +1,49 @@
 # Changelog
 
+## v1.4.0
+
+### Fixed (security)
+- Integrity failures used the full error message as a Prometheus label, and those
+  messages embed the S3 key. This reintroduced through `consume_integrity_error` the
+  unbounded label cardinality that v1.3.0 removed elsewhere: 50 distinct keys produced
+  50 series. Reasons are now fixed codes (`etag_mismatch`, `sha256_mismatch`,
+  `missing_checksum`, `prefix_violation`, `unexpected_bucket`, `object_too_large`,
+  `decompressed_too_large`, `decompression_failed`, `unsupported_compression`,
+  `missing_etag`), and the key stays in the exception and DLQ record only.
+- A `prefix` of `"/"` collapsed to an empty string, silently disabling prefix
+  enforcement. Now rejected at construction on both the producer and the consumer.
+- `sse_kms_key_id` was accepted without `server_side_encryption: "aws:kms"`, sending a
+  KMS key id that S3 ignores, so objects were not KMS-encrypted as intended. Both this
+  and unknown SSE modes are now rejected.
+
+### Fixed (correctness)
+- `delete_after_consume` removed the S3 object before `poll()` returned, so a crash
+  between poll and processing lost the record from both Kafka and S3. With
+  `enable.auto.commit: False` deletion is now deferred until `commit()`; uncommitted
+  deletes are dropped on `close()`. Auto-commit keeps the old behaviour and now logs a
+  warning about the window.
+- Payloads above 8 MiB (configurable via `multipart_threshold`) upload via multipart
+  instead of a single PUT, which S3 caps at 5 GiB. Multipart references carry no `etag`,
+  since a multipart ETag is not a content checksum; SHA-256 still covers those.
+- Broker errors raise `KafkaException` rather than a bare `Exception`.
+- `/metrics` groups samples by family and emits `# TYPE`. Interleaved families are
+  invalid exposition and strict parsers reject them.
+
+### Changed
+- Rewrote the Grafana dashboard. The old one plotted raw counters with `sum()` instead of
+  `rate()` and contained an invalid expression (`increase(consume_inline[5m]*0)`, which
+  multiplies a range vector). Seven panels now cover produce/consume rate and throughput,
+  integrity failures by reason, skips, and delivery outcomes.
+- `config/prometheus.yml` gained a Kubernetes pod-discovery job matching the scrape
+  annotations the chart now sets.
+- Helm: pod annotations for Prometheus discovery, and `envFrom` so SASL and SSL passwords
+  come from a Secret rather than plaintext in values.
+- Every GitHub release since v1.0.0 shipped with empty notes: the extraction step split
+  the changelog on `^## ` after prepending `"## "`, so it always took the empty string
+  before the delimiter. The logic now lives in `.github/scripts/release_notes.py`, is
+  covered by tests, and fails the release when the tag does not match the top CHANGELOG
+  section rather than publishing nothing.
+
 ## v1.3.0
 
 ### Fixed (blocking)

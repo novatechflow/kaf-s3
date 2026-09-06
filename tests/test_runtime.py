@@ -98,3 +98,20 @@ def test_metrics_server_serves_metrics():
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_render_groups_families_and_declares_type():
+    """Prometheus requires one TYPE per family with its samples grouped together."""
+    reg = MetricsRegistry()
+    reg.inc("consume_success", {"topic": "b"})
+    reg.inc("consume_integrity_error", {"reason": "etag_mismatch"})
+    reg.inc("consume_success", {"topic": "a"})
+
+    lines = reg.render().strip().splitlines()
+    assert lines == [
+        "# TYPE consume_integrity_error counter",
+        'consume_integrity_error{reason="etag_mismatch"} 1',
+        "# TYPE consume_success counter",
+        'consume_success{topic="a"} 1',
+        'consume_success{topic="b"} 1',
+    ]

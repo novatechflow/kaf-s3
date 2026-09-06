@@ -280,3 +280,104 @@ def test_s3_client_uses_region_and_endpoint(mocker):
     mock_boto3.client.assert_called_once_with(
         "s3", region_name="eu-central-1", endpoint_url="https://minio.local:9000"
     )
+
+
+def test_large_payload_uses_multipart_upload(mocker):
+    """Objects past the threshold go through multipart, not a single PUT."""
+    mock_boto3 = mocker.patch("s3_connector.producer.boto3")
+    mock_kafka_producer_class = mocker.patch("s3_connector.producer.Producer")
+    mock_s3 = mock_boto3.client.return_value
+
+    cfg = {
+        "kafka": {"bootstrap.servers": "mock:9092"},
+        "s3": {"bucket": "test-bucket", "max_inline_bytes": 0, "multipart_threshold": 16},
+    }
+    producer = S3Producer(cfg)
+    producer.produce("topic", b"x" * 64)
+
+    mock_s3.put_object.assert_not_called()
+    mock_s3.upload_fileobj.assert_called_once()
+    args, kwargs = mock_s3.upload_fileobj.call_args
+    assert args[1] == "test-bucket"
+
+    ref = json.loads(mock_kafka_producer_class.return_value.produce.call_args.kwargs["value"])
+    assert ref["etag"] is None
+    assert ref["sha256"]
+
+
+def test_small_payload_still_uses_single_put(mocker):
+    """The fast path keeps the ETag that the consumer verifies."""
+    mock_boto3 = mocker.patch("s3_connector.producer.boto3")
+    mocker.patch("s3_connector.producer.Producer")
+    mock_s3 = mock_boto3.client.return_value
+    mock_s3.put_object.return_value = {"ETag": '"abc"'}
+
+    cfg = {
+        "kafka": {"bootstrap.servers": "mock:9092"},
+        "s3": {"bucket": "test-bucket", "max_inline_bytes": 0, "multipart_threshold": 1024},
+    }
+    S3Producer(cfg).produce("topic", b"x" * 64)
+
+    mock_s3.upload_fileobj.assert_not_called()
+    mock_s3.put_object.assert_called_once()
+
+
+def test_multipart_upload_carries_encryption_options(mocker):
+    """SSE settings must not be dropped on the multipart path."""
+    mock_boto3 = mocker.patch("s3_connector.producer.boto3")
+    mocker.patch("s3_connector.producer.Producer")
+    mock_s3 = mock_boto3.client.return_value
+
+    cfg = {
+        "kafka": {"bootstrap.servers": "mock:9092"},
+        "s3": {
+            "bucket": "test-bucket",
+            "max_inline_bytes": 0,
+            "multipart_threshold": 16,
+            "server_side_encryption": "aws:kms",
+            "sse_kms_key_id": "key-123",
+        },
+    }
+    S3Producer(cfg).produce("topic", b"x" * 64)
+
+    extra = mock_s3.upload_fileobj.call_args.kwargs["ExtraArgs"]
+    assert extra["ServerSideEncryption"] == "aws:kms"
+    assert extra["SSEKMSKeyId"] == "key-123"
+
+
+def test_kms_key_without_kms_mode_is_rejected(mocker):
+    """A KMS key id with no SSE mode would silently not use KMS."""
+    mocker.patch("s3_connector.producer.boto3")
+    mocker.patch("s3_connector.producer.Producer")
+
+    with pytest.raises(ValueError):
+        S3Producer({
+            "kafka": {"bootstrap.servers": "mock:9092"},
+            "s3": {"bucket": "b", "sse_kms_key_id": "key-123"},
+        })
+
+    with pytest.raises(ValueError):
+        S3Producer({
+            "kafka": {"bootstrap.servers": "mock:9092"},
+            "s3": {"bucket": "b", "server_side_encryption": "AES256", "sse_kms_key_id": "key-123"},
+        })
+
+
+def test_unknown_sse_mode_is_rejected(mocker):
+    mocker.patch("s3_connector.producer.boto3")
+    mocker.patch("s3_connector.producer.Producer")
+    with pytest.raises(ValueError):
+        S3Producer({
+            "kafka": {"bootstrap.servers": "mock:9092"},
+            "s3": {"bucket": "b", "server_side_encryption": "rot13"},
+        })
+
+
+def test_prefix_that_collapses_to_empty_is_rejected(mocker):
+    mocker.patch("s3_connector.producer.boto3")
+    mocker.patch("s3_connector.producer.Producer")
+    with pytest.raises(ValueError):
+        S3Producer({
+            "kafka": {"bootstrap.servers": "mock:9092"},
+            "s3": {"bucket": "b", "prefix": "/"},
+        })
