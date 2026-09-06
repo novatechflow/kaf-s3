@@ -11,8 +11,17 @@ def consumer_config():
             "group.id": "test-group",
             "test.mock.num.brokers": 3
         },
-        "s3": {"bucket": "test-bucket", "delete_after_consume": True}
+        "s3": {"bucket": "test-bucket"},
     }
+
+
+@pytest.fixture
+def deleting_config(consumer_config):
+    """delete_after_consume is only accepted alongside manual commits."""
+    cfg = json.loads(json.dumps(consumer_config))
+    cfg["kafka"]["enable.auto.commit"] = False
+    cfg["s3"]["delete_after_consume"] = True
+    return cfg
 
 def test_consumer_init(mocker, consumer_config):
     """Tests the initialization of the S3Consumer."""
@@ -24,7 +33,7 @@ def test_consumer_init(mocker, consumer_config):
     assert consumer.kafka_consumer is not None
     assert consumer.s3_client is not None
 
-def test_poll_message(mocker, consumer_config):
+def test_poll_message(mocker, deleting_config):
     """Tests polling and successfully retrieving a message."""
     mock_boto3 = mocker.patch("s3_connector.consumer.boto3")
     mock_kafka_consumer_class = mocker.patch("s3_connector.consumer.Consumer")
@@ -51,11 +60,15 @@ def test_poll_message(mocker, consumer_config):
     mock_s3_response["Body"].read.return_value = s3_payload
     mock_boto3.client.return_value.get_object.return_value = mock_s3_response
 
-    consumer = S3Consumer(consumer_config)
+    consumer = S3Consumer(deleting_config)
     payload = consumer.poll()
 
     assert payload == s3_payload
     mock_boto3.client.return_value.get_object.assert_called_once_with(Bucket="test-bucket", Key="test-key")
+
+    # Deletion waits for the commit that makes the offset durable.
+    mock_boto3.client.return_value.delete_object.assert_not_called()
+    consumer.commit()
     mock_boto3.client.return_value.delete_object.assert_called_once_with(Bucket="test-bucket", Key="test-key")
 
 def test_poll_data_integrity_error(mocker, consumer_config):
@@ -456,7 +469,7 @@ def test_integrity_error_metric_label_is_a_fixed_code(mocker, consumer_config):
     assert reasons == {"etag_mismatch"}
 
 
-def test_delete_is_deferred_until_commit_when_auto_commit_is_off(mocker, consumer_config):
+def test_delete_is_deferred_until_commit_when_auto_commit_is_off(mocker, deleting_config):
     """The object must outlive poll() so a crash before commit is recoverable."""
     mock_boto3 = mocker.patch("s3_connector.consumer.boto3")
     mock_consumer_class = mocker.patch("s3_connector.consumer.Consumer")
@@ -467,8 +480,7 @@ def test_delete_is_deferred_until_commit_when_auto_commit_is_off(mocker, consume
     response["Body"].read.return_value = b"payload"
     mock_boto3.client.return_value.get_object.return_value = response
 
-    cfg = json.loads(json.dumps(consumer_config))
-    cfg["kafka"]["enable.auto.commit"] = False
+    cfg = json.loads(json.dumps(deleting_config))
     cfg["s3"]["require_integrity"] = False
     consumer = S3Consumer(cfg)
 
@@ -481,7 +493,7 @@ def test_delete_is_deferred_until_commit_when_auto_commit_is_off(mocker, consume
     )
 
 
-def test_uncommitted_deletes_are_dropped_on_close(mocker, consumer_config):
+def test_uncommitted_deletes_are_dropped_on_close(mocker, deleting_config):
     """Never delete an object whose offset was never committed."""
     mock_boto3 = mocker.patch("s3_connector.consumer.boto3")
     mock_consumer_class = mocker.patch("s3_connector.consumer.Consumer")
@@ -492,8 +504,7 @@ def test_uncommitted_deletes_are_dropped_on_close(mocker, consumer_config):
     response["Body"].read.return_value = b"payload"
     mock_boto3.client.return_value.get_object.return_value = response
 
-    cfg = json.loads(json.dumps(consumer_config))
-    cfg["kafka"]["enable.auto.commit"] = "false"
+    cfg = json.loads(json.dumps(deleting_config))
     cfg["s3"]["require_integrity"] = False
     consumer = S3Consumer(cfg)
     consumer.poll()
@@ -563,7 +574,7 @@ def test_incomplete_reference_is_skipped_when_inline_is_disabled(mocker, consume
     assert skips == ["missing_key"]
 
 
-def test_commit_is_forced_synchronous_when_deletes_are_pending(mocker, consumer_config):
+def test_commit_is_forced_synchronous_when_deletes_are_pending(mocker, deleting_config):
     """An async commit has not reached the broker, so deleting on its return is unsafe."""
     mock_boto3 = mocker.patch("s3_connector.consumer.boto3")
     mock_consumer_class = mocker.patch("s3_connector.consumer.Consumer")
@@ -576,8 +587,7 @@ def test_commit_is_forced_synchronous_when_deletes_are_pending(mocker, consumer_
     response["Body"].read.return_value = b"payload"
     mock_boto3.client.return_value.get_object.return_value = response
 
-    cfg = json.loads(json.dumps(consumer_config))
-    cfg["kafka"]["enable.auto.commit"] = False
+    cfg = json.loads(json.dumps(deleting_config))
     cfg["s3"]["require_integrity"] = False
     consumer = S3Consumer(cfg)
 
@@ -694,7 +704,7 @@ def test_other_s3_errors_still_propagate(mocker, consumer_config, code):
         S3Consumer(consumer_config).poll()
 
 
-def test_deterministic_objects_are_not_deleted(mocker, consumer_config):
+def test_deterministic_objects_are_not_deleted(mocker, deleting_config):
     """A shared object must outlive the first message that references it."""
     mock_boto3 = mocker.patch("s3_connector.consumer.boto3")
     mock_consumer_class = mocker.patch("s3_connector.consumer.Consumer")
@@ -705,14 +715,14 @@ def test_deterministic_objects_are_not_deleted(mocker, consumer_config):
     response["Body"].read.return_value = b"payload"
     mock_boto3.client.return_value.get_object.return_value = response
 
-    cfg = json.loads(json.dumps(consumer_config))
+    cfg = json.loads(json.dumps(deleting_config))
     cfg["s3"]["require_integrity"] = False
 
     assert S3Consumer(cfg).poll() == b"payload"
     mock_boto3.client.return_value.delete_object.assert_not_called()
 
 
-def test_non_deterministic_objects_are_still_deleted(mocker, consumer_config):
+def test_non_deterministic_objects_are_still_deleted(mocker, deleting_config):
     mock_boto3 = mocker.patch("s3_connector.consumer.boto3")
     mock_consumer_class = mocker.patch("s3_connector.consumer.Consumer")
 
@@ -722,10 +732,12 @@ def test_non_deterministic_objects_are_still_deleted(mocker, consumer_config):
     response["Body"].read.return_value = b"payload"
     mock_boto3.client.return_value.get_object.return_value = response
 
-    cfg = json.loads(json.dumps(consumer_config))
+    cfg = json.loads(json.dumps(deleting_config))
     cfg["s3"]["require_integrity"] = False
 
-    S3Consumer(cfg).poll()
+    consumer = S3Consumer(cfg)
+    consumer.poll()
+    consumer.commit()
     mock_boto3.client.return_value.delete_object.assert_called_once()
 
 
@@ -756,7 +768,7 @@ def _deferred_delete_consumer(mocker, deleted):
     consumer = S3Consumer({
         "kafka": {"bootstrap.servers": "x", "group.id": "g", "enable.auto.commit": False},
         "s3": {"bucket": "test-bucket", "delete_after_consume": True, "require_integrity": False},
-    })
+    })  # delete_after_consume requires manual commits
     consumer.subscribe(["t"])
     return consumer, mock_consumer_class
 
@@ -773,9 +785,10 @@ def test_commit_of_one_message_only_deletes_up_to_its_offset(mocker):
     consumer.commit(message=_ref_msg(0, 10, "p0-o10"))
 
     assert deleted == ["p0-o10"]
-    assert {k: [e[0] for e in v] for k, v in consumer._pending_deletes.items()} == {
-        ("t", 0): [11], ("t", 1): [5],
-    }
+    assert {
+        key: [offset for offset, _b, _k in entries]
+        for key, entries in consumer._pending_deletes._by_partition.items()
+    } == {("t", 0): [11], ("t", 1): [5]}
 
 
 def test_revoked_partitions_drop_their_deferred_deletions(mocker):
@@ -838,3 +851,26 @@ def test_bucket_with_surrounding_whitespace_is_rejected(mocker):
             "kafka": {"bootstrap.servers": "x", "group.id": "g"},
             "s3": {"bucket": " my-bucket "},
         })
+
+
+def test_delete_after_consume_refuses_auto_commit(mocker, consumer_config):
+    """The auto-commit variant deletes before the payload is processed."""
+    mocker.patch("s3_connector.consumer.boto3")
+    mocker.patch("s3_connector.consumer.Consumer")
+
+    cfg = json.loads(json.dumps(consumer_config))
+    cfg["s3"]["delete_after_consume"] = True
+
+    with pytest.raises(ValueError, match="enable.auto.commit"):
+        S3Consumer(cfg)
+
+
+def test_delete_after_consume_warns_about_other_consumer_groups(mocker, deleting_config, caplog):
+    """No consumer can tell whether another group still needs the object."""
+    mocker.patch("s3_connector.consumer.boto3")
+    mocker.patch("s3_connector.consumer.Consumer")
+
+    with caplog.at_level("WARNING"):
+        S3Consumer(deleting_config)
+
+    assert "sole consumer group" in caplog.text

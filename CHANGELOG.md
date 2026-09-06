@@ -1,5 +1,43 @@
 # Changelog
 
+## v1.9.0
+
+This release revisits `delete_after_consume`, which has needed correcting in four
+consecutive releases. The conclusion is that the feature is sound only under a
+precondition it cannot verify, so the release makes the precondition explicit, refuses
+the configuration that is outright unsafe, and promotes S3 lifecycle rules to the
+recommended mechanism by making them actually work.
+
+### Breaking
+- `delete_after_consume` now requires `enable.auto.commit: False` and raises otherwise.
+  Under auto-commit the object is removed before the payload is processed, so a crash
+  loses the record — a window previously covered by a log warning while doing it anyway.
+  Since auto-commit is the librdkafka default, this was the combination most users would
+  have hit; the project's own test fixture used it.
+
+### Fixed
+- `ttl_seconds` did nothing. It wrote a `ttl_epoch` user-metadata entry, and S3 lifecycle
+  rules can filter on prefix, tags and object size but not on user metadata, so no rule
+  could ever act on it. Objects are now also tagged `kaf-s3-ttl-seconds=<n>`, on both the
+  single-PUT and multipart paths, which a lifecycle rule can filter on. Non-positive
+  `ttl_seconds` is rejected rather than silently ignored.
+
+### Added
+- `config/s3-lifecycle.json`: a ready-to-apply lifecycle policy matching the tag the
+  producer writes, plus a prefix-based rule and an `AbortIncompleteMultipartUpload` rule.
+  A test asserts the shipped policy and the emitted tag stay in agreement.
+- A startup warning that `delete_after_consume` is only correct when the topic has a
+  single consumer group. No consumer can detect other groups, so a warning is the limit of
+  what the library can do about it.
+
+### Changed
+- Deferred-deletion bookkeeping moved out of `S3Consumer` into `PendingDeletes`, covered
+  by its own unit tests. The behaviour is unchanged; it was spread across five methods of
+  a class that also does polling, integrity checking and DLQ publication.
+- README has a "Reclaiming S3 storage" section that recommends lifecycle rules, states
+  `delete_after_consume`'s precondition plainly, and documents how deferred deletion
+  behaves.
+
 ## v1.8.1
 
 ### Fixed

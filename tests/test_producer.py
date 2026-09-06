@@ -497,3 +497,55 @@ def test_deterministic_references_are_marked(mocker):
         S3Producer(cfg).produce("topic", b"payload" * 100)
         ref = json.loads(mock_kafka_producer_class.return_value.produce.call_args.kwargs["value"])
         assert ref.get("deterministic") is expected
+
+
+def test_ttl_seconds_writes_a_lifecycle_usable_tag(mocker):
+    """S3 lifecycle rules filter on tags; user metadata drives nothing."""
+    mock_boto3 = mocker.patch("s3_connector.producer.boto3")
+    mocker.patch("s3_connector.producer.Producer")
+    mock_boto3.client.return_value.put_object.return_value = {"ETag": '"e"'}
+
+    cfg = {
+        "kafka": {"bootstrap.servers": "mock:9092"},
+        "s3": {"bucket": "b", "max_inline_bytes": 0, "ttl_seconds": 86400},
+    }
+    S3Producer(cfg).produce("topic", b"payload" * 100)
+
+    kwargs = mock_boto3.client.return_value.put_object.call_args.kwargs
+    assert kwargs["Tagging"] == "kaf-s3-ttl-seconds=86400"
+    assert kwargs["Metadata"]["ttl_epoch"]
+
+
+def test_ttl_tag_reaches_the_multipart_path(mocker):
+    mock_boto3 = mocker.patch("s3_connector.producer.boto3")
+    mocker.patch("s3_connector.producer.Producer")
+
+    cfg = {
+        "kafka": {"bootstrap.servers": "mock:9092"},
+        "s3": {"bucket": "b", "max_inline_bytes": 0, "multipart_threshold": 16,
+               "ttl_seconds": 3600},
+    }
+    S3Producer(cfg).produce("topic", b"x" * 64)
+
+    extra = mock_boto3.client.return_value.upload_fileobj.call_args.kwargs["ExtraArgs"]
+    assert extra["Tagging"] == "kaf-s3-ttl-seconds=3600"
+
+
+@pytest.mark.parametrize("ttl", [0, -1])
+def test_non_positive_ttl_is_rejected(mocker, ttl):
+    mocker.patch("s3_connector.producer.boto3")
+    mocker.patch("s3_connector.producer.Producer")
+    with pytest.raises(ValueError, match="ttl_seconds"):
+        S3Producer({"kafka": {"bootstrap.servers": "mock:9092"},
+                    "s3": {"bucket": "b", "ttl_seconds": ttl}})
+
+
+def test_shipped_lifecycle_policy_matches_the_tag_we_write():
+    import json as _json
+    import pathlib
+
+    policy = _json.loads(
+        (pathlib.Path(__file__).resolve().parents[1] / "config" / "s3-lifecycle.json").read_text()
+    )
+    tags = [r["Filter"]["Tag"]["Key"] for r in policy["Rules"] if "Tag" in r.get("Filter", {})]
+    assert "kaf-s3-ttl-seconds" in tags
