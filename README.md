@@ -67,6 +67,8 @@ producer_config = {
         # "deterministic_keys": False,     # use payload hash for idempotent keys
         # "multipart_threshold": 8388608,  # switch to multipart above this size;
                                            #   S3 caps a single PUT at 5 GiB
+        # "produce_timeout": 30.0,         # how long to apply backpressure when
+                                           #   librdkafka's local queue is full
         # "compression": "gzip",           # compress before S3 upload (gzip or None)
         # "ttl_seconds": 86400,            # writes a ttl_epoch object metadata hint;
                                            #   expiry itself requires an S3 lifecycle rule
@@ -99,7 +101,9 @@ consumer_config = {
         # "compression": "gzip",           # decompress automatically on consume
         # "deterministic_keys": False,     # use payload hash for idempotent keys
         # "multipart_threshold": 8388608,  # switch to multipart above this size;
-                                           #   S3 caps a single PUT at 5 GiB (producer)
+                                           #   S3 caps a single PUT at 5 GiB
+        # "produce_timeout": 30.0,         # how long to apply backpressure when
+                                           #   librdkafka's local queue is full (producer)
         # "ttl_seconds": 86400,            # hint TTL stored in object metadata (producer)
         # "server_side_encryption": "aws:kms", # SSE, optionally with KMS key below (producer)
         # "sse_kms_key_id": "<kms-key-id>",    # (producer)
@@ -249,7 +253,7 @@ echo "hello" | docker run --rm -i \
 Configuration is driven by env vars:
 - Kafka: `KAFKA_BOOTSTRAP_SERVERS`, `KAFKA_GROUP_ID` (consumer), `DLQ_TOPIC`, `KAFKA_SECURITY_PROTOCOL`, `KAFKA_SASL_*`, `KAFKA_SSL_*`, etc.
 - S3: `S3_BUCKET`, `S3_PREFIX`, `S3_DELETE_AFTER_CONSUME`, `S3_ALLOW_INLINE_PAYLOADS`, `S3_MAX_INLINE_BYTES`, `S3_MAX_PAYLOAD_BYTES`, `S3_DETERMINISTIC_KEYS`, `S3_COMPRESSION` (`gzip`), `S3_TTL_SECONDS`, `S3_SSE`, `S3_SSE_KMS_KEY_ID`.
-- App: `MODE` (`producer`|`consumer`), `TOPIC`, `POLL_TIMEOUT`, `METRICS_PORT` (default 8000), `METRICS_ADDRESS` (default all interfaces), `LOG_LEVEL`.
+- App: `MODE` (`producer`|`consumer`), `TOPIC`, `POLL_TIMEOUT`, `METRICS_PORT` (default 8000; the image healthcheck follows it), `METRICS_ADDRESS` (default all interfaces), `LOG_LEVEL`.
 - Also: `AWS_REGION`, `S3_ENDPOINT_URL`, `S3_REQUIRE_INTEGRITY`, `KAFKA_ENABLE_AUTO_COMMIT`.
 - Boolean env vars accept `true`/`1`/`yes`/`on` (case-insensitive); anything else is false.
 - With `KAFKA_ENABLE_AUTO_COMMIT=false` the container commits after each payload, giving at-least-once delivery.
@@ -257,6 +261,7 @@ Configuration is driven by env vars:
 ### Metrics
 - `/metrics` exposes Prometheus text format on `METRICS_PORT` (default 8000).
 - Only low-cardinality labels (`topic`, `partition`, `reason`) become series. Payload sizes are aggregated into `<event>_bytes` counters rather than one series per size, and S3 keys are never used as labels. `reason` is always a fixed code, never a formatted message.
+- Skip reason `object_missing` covers objects that are gone: a TTL lifecycle rule fired, another consumer group deleted them, or an auto-committed message is being replayed. Other S3 errors (`AccessDenied`, `NoSuchBucket`, throttling) propagate to the caller.
 - Integrity reasons: `etag_mismatch`, `sha256_mismatch`, `missing_checksum`, `missing_etag`, `prefix_violation`, `unexpected_bucket`, `object_too_large`, `decompressed_too_large`, `decompression_failed`, `unsupported_compression`. Skip reasons: `tombstone`, `malformed_message`, `missing_key`.
 - The endpoint is unauthenticated. Keep it on an internal network, or bind it explicitly with `METRICS_ADDRESS`.
 - Sample Prometheus scrape config: `config/prometheus.yml`
@@ -276,6 +281,10 @@ helm upgrade --install kaf-s3 charts/kaf-s3-connector \
   --set env.KAFKA_GROUP_ID=my-group \
   --set env.S3_BUCKET=my-large-messages-bucket
 ```
+
+`service.port` drives the Service, container port, both probes, the scrape annotation and
+the app's `METRICS_PORT` — set it alone to move the metrics endpoint, and do not put
+`METRICS_PORT` in `env`.
 
 Kafka SASL/SSL passwords belong in a Secret, not in `values.env`, which renders into the
 Deployment in plain text:

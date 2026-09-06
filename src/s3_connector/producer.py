@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 # S3 accepts at most 5 GiB in a single PUT; larger objects require multipart.
 SINGLE_PUT_LIMIT_BYTES = 5 * 1024 * 1024 * 1024
 DEFAULT_MULTIPART_THRESHOLD_BYTES = 8 * 1024 * 1024
+DEFAULT_PRODUCE_TIMEOUT_SECONDS = 30.0
 
 class S3Producer:
     def __init__(self, config):
@@ -46,6 +47,9 @@ class S3Producer:
         self.multipart_threshold = self.s3_config.get(
             "multipart_threshold", DEFAULT_MULTIPART_THRESHOLD_BYTES
         )
+        self.produce_timeout = self.s3_config.get(
+            "produce_timeout", DEFAULT_PRODUCE_TIMEOUT_SECONDS
+        )
         self.metric_callback = self.hooks.get("metrics")
 
         if self.max_inline_bytes < 0:
@@ -64,6 +68,8 @@ class S3Producer:
             raise ValueError(
                 f"multipart_threshold must be between 1 and {SINGLE_PUT_LIMIT_BYTES}."
             )
+        if self.produce_timeout < 0:
+            raise ValueError("produce_timeout must be non-negative.")
 
     def produce(self, topic, payload, key=None):
         """
@@ -82,7 +88,12 @@ class S3Producer:
             raise ValueError(f"Payload size {payload_length} exceeds max_payload_bytes {self.max_payload_bytes}.")
 
         if payload_length <= self.max_inline_bytes:
-            self.kafka_producer.produce(topic, key=key, value=bytes(payload))
+            self._produce(
+                topic,
+                key,
+                bytes(payload),
+                on_delivery=lambda err, msg: self._on_delivery(err, msg, None, None),
+            )
             self.kafka_producer.poll(0)
             self._emit_metric("produce_inline", topic=topic, bytes=payload_length)
             return
@@ -106,10 +117,10 @@ class S3Producer:
         }
 
         try:
-            self.kafka_producer.produce(
+            self._produce(
                 topic,
-                key=key,
-                value=json.dumps(reference_message).encode('utf-8'),
+                key,
+                json.dumps(reference_message).encode('utf-8'),
                 on_delivery=lambda err, msg: self._on_delivery(err, msg, s3_key, reference_message),
             )
         except Exception:
@@ -118,6 +129,26 @@ class S3Producer:
 
         self.kafka_producer.poll(0)
         self._emit_metric("produce_offloaded", topic=topic, bytes=payload_length, s3_key=s3_key)
+
+    def _produce(self, topic, key, value, on_delivery=None):
+        """
+        Enqueues a message, applying backpressure instead of failing outright
+        when librdkafka's local queue is full.
+
+        produce() raises BufferError once the queue reaches
+        queue.buffering.max.messages. Serving delivery reports drains it, so a
+        burst waits rather than losing the message it has already uploaded.
+        """
+        deadline = time.monotonic() + self.produce_timeout
+        while True:
+            try:
+                self.kafka_producer.produce(topic, key=key, value=value, on_delivery=on_delivery)
+                return
+            except BufferError:
+                if time.monotonic() >= deadline:
+                    self._emit_metric("produce_queue_full", topic=topic)
+                    raise
+                self.kafka_producer.poll(0.1)
 
     def _object_kwargs(self):
         """
@@ -198,20 +229,30 @@ class S3Producer:
 
     def _on_delivery(self, err, msg, s3_key, reference_message):
         """
-        Delivery callback to clean up S3 objects when Kafka delivery fails.
+        Delivery callback for both paths. Inline messages carry no S3 key, so
+        they are reported but have nothing to roll back.
         """
-        if err:
+        if not err:
+            self._emit_metric(
+                "produce_delivered", topic=msg.topic(), partition=msg.partition(), offset=msg.offset()
+            )
+            return
+
+        if s3_key is None:
+            logger.error("Kafka delivery failed for inline message: %s", err)
+        else:
             logger.error("Kafka delivery failed for S3 key %s: %s", s3_key, err)
             self._cleanup_s3_object(s3_key)
-            self._emit_metric("produce_error", error=str(err), s3_key=s3_key)
-            if self.dlq_topic:
-                try:
-                    dlq_payload = json.dumps({"error": str(err), "reference": reference_message}).encode("utf-8")
-                    self.kafka_producer.produce(self.dlq_topic, value=dlq_payload)
-                except Exception as dlq_err:  # pragma: no cover - best effort
-                    logger.warning("Failed to publish to DLQ %s: %s", self.dlq_topic, dlq_err)
-        else:
-            self._emit_metric("produce_delivered", topic=msg.topic(), partition=msg.partition(), offset=msg.offset())
+        self._emit_metric("produce_error", error=str(err), s3_key=s3_key)
+
+        if self.dlq_topic:
+            try:
+                dlq_payload = json.dumps(
+                    {"error": str(err), "reference": reference_message}
+                ).encode("utf-8")
+                self.kafka_producer.produce(self.dlq_topic, value=dlq_payload)
+            except Exception as dlq_err:  # pragma: no cover - best effort
+                logger.warning("Failed to publish to DLQ %s: %s", self.dlq_topic, dlq_err)
 
     def _build_s3_key(self, payload):
         """

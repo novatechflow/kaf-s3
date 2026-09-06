@@ -5,6 +5,8 @@ image:
 
 replicaCount: 1
 
+# The metrics port. Used for the Service, the container port, both probes, the
+# scrape annotation, and the app's METRICS_PORT - do not set METRICS_PORT in env.
 service:
   type: ClusterIP
   port: 8000
@@ -16,7 +18,6 @@ env:
   KAFKA_BOOTSTRAP_SERVERS: localhost:9092
   KAFKA_GROUP_ID: my-s3-consumers
   S3_BUCKET: my-large-messages-bucket
-  METRICS_PORT: "8000"
 
 # Secrets (KAFKA_SASL_PASSWORD, KAFKA_SSL_KEY_PASSWORD, ...) belong in a Secret,
 # not in values. List the Secret or ConfigMap names to load them from.
@@ -26,7 +27,6 @@ envFrom: []
 
 podAnnotations:
   prometheus.io/scrape: "true"
-  prometheus.io/port: "8000"
   prometheus.io/path: /metrics
 
 podSecurityContext:

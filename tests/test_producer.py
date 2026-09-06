@@ -84,7 +84,11 @@ def test_produce_inline_message(mocker):
     # S3 is not called for inline payloads
     mock_boto3.client.return_value.put_object.assert_not_called()
 
-    mock_kafka_producer_instance.produce.assert_called_once_with(topic, key=None, value=payload)
+    args, kwargs = mock_kafka_producer_instance.produce.call_args
+    assert args == (topic,)
+    assert kwargs["key"] is None
+    assert kwargs["value"] == payload
+    assert kwargs["on_delivery"] is not None
     mock_kafka_producer_instance.poll.assert_called_once_with(0)
 
 def test_produce_cleanup_on_error(mocker, producer_config):
@@ -391,3 +395,63 @@ def test_empty_bucket_is_rejected(mocker, bucket):
     s3 = {} if bucket is None else {"bucket": bucket}
     with pytest.raises(ValueError, match="bucket"):
         S3Producer({"kafka": {"bootstrap.servers": "mock:9092"}, "s3": s3})
+
+
+def test_produce_applies_backpressure_when_the_queue_is_full(mocker, producer_config):
+    """A full local queue should drain and retry, not drop an uploaded payload."""
+    mock_boto3 = mocker.patch("s3_connector.producer.boto3")
+    mock_kafka_producer_class = mocker.patch("s3_connector.producer.Producer")
+    mock_producer = mock_kafka_producer_class.return_value
+    mock_boto3.client.return_value.put_object.return_value = {"ETag": '"e"'}
+
+    attempts = []
+
+    def produce(*args, **kwargs):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise BufferError("Local: Queue full")
+
+    mock_producer.produce.side_effect = produce
+
+    S3Producer(producer_config).produce("topic", b"payload" * 100)
+
+    assert len(attempts) == 3
+    mock_boto3.client.return_value.delete_object.assert_not_called()
+
+
+def test_produce_gives_up_after_produce_timeout(mocker):
+    """Backpressure is bounded; a permanently full queue still surfaces."""
+    mock_boto3 = mocker.patch("s3_connector.producer.boto3")
+    mock_kafka_producer_class = mocker.patch("s3_connector.producer.Producer")
+    mock_kafka_producer_class.return_value.produce.side_effect = BufferError("Local: Queue full")
+    mock_boto3.client.return_value.put_object.return_value = {"ETag": '"e"'}
+
+    cfg = {
+        "kafka": {"bootstrap.servers": "mock:9092"},
+        "s3": {"bucket": "test-bucket", "max_inline_bytes": 0, "produce_timeout": 0},
+    }
+    with pytest.raises(BufferError):
+        S3Producer(cfg).produce("topic", b"payload" * 100)
+
+    mock_boto3.client.return_value.delete_object.assert_called_once()
+
+
+def test_inline_delivery_failures_are_reported(mocker):
+    """Inline messages had no delivery callback, so their failures were silent."""
+    mocker.patch("s3_connector.producer.boto3")
+    mock_kafka_producer_class = mocker.patch("s3_connector.producer.Producer")
+
+    events = []
+    cfg = {
+        "kafka": {"bootstrap.servers": "mock:9092"},
+        "s3": {"bucket": "test-bucket", "max_inline_bytes": 1000},
+        "hooks": {"metrics": lambda event, data: events.append(event)},
+    }
+
+    def produce(*args, **kwargs):
+        kwargs["on_delivery"](Exception("delivery-fail"), mocker.Mock())
+
+    mock_kafka_producer_class.return_value.produce.side_effect = produce
+    S3Producer(cfg).produce("topic", b"small")
+
+    assert "produce_error" in events

@@ -1,5 +1,29 @@
 # Changelog
 
+## v1.6.0
+
+### Fixed
+- A missing S3 object raised a raw `botocore` `ClientError` out of `poll()`, killing the
+  consumer. Objects go missing for ordinary reasons — a `ttl_seconds` lifecycle rule
+  fired, another consumer group ran with `delete_after_consume`, or an auto-committed
+  message is being replayed — so the message is now skipped with reason `object_missing`.
+  Credential, bucket and throttling errors still propagate to the caller.
+- `produce()` raised `BufferError` as soon as librdkafka's local queue filled, discarding
+  the S3 object it had just uploaded. Produce now drains delivery reports and retries for
+  up to `produce_timeout` (30 s) before giving up, applying backpressure instead of
+  failing a burst.
+- Inline messages were produced without a delivery callback, so their delivery failures
+  were silent — no log line, no `produce_error` metric. They are now reported like
+  offloaded messages; there is simply no S3 object to roll back.
+- The image healthcheck probed a hardcoded port 8000 while `METRICS_PORT` is configurable,
+  so any other port left the container permanently unhealthy. It now reads `METRICS_PORT`.
+
+### Changed
+- The chart had three places to set the port — `service.port`, `env.METRICS_PORT` and the
+  scrape annotation. Setting only `service.port` moved the Service, container port and
+  both probes while the app kept listening on 8000, producing a liveness restart loop.
+  `service.port` is now the single source of truth for all four.
+
 ## v1.5.0
 
 ### Fixed (data loss)
