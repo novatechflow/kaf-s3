@@ -16,6 +16,10 @@ recommended mechanism by making them actually work.
   have hit; the project's own test fixture used it.
 
 ### Fixed
+- `multipart_threshold` only chose which S3 API to call. Inside `upload_fileobj` boto3
+  applied its own 8 MiB threshold, so a payload between the two sizes uploaded as a single
+  part while the reference still dropped its ETag. An explicit `TransferConfig` now makes
+  the setting mean what it says. Found by the new integration suite.
 - `ttl_seconds` did nothing. It wrote a `ttl_epoch` user-metadata entry, and S3 lifecycle
   rules can filter on prefix, tags and object size but not on user metadata, so no rule
   could ever act on it. Objects are now also tagged `kaf-s3-ttl-seconds=<n>`, on both the
@@ -23,6 +27,10 @@ recommended mechanism by making them actually work.
   `ttl_seconds` is rejected rather than silently ignored.
 
 ### Added
+- An integration suite that runs the connector against a real Kafka broker and a real S3
+  service in throwaway containers: round trips across every storage option, plus tests
+  pinning the real Kafka and S3 behaviours that past bugs got wrong. Opt-in via
+  `pytest -m integration`, skipped without Docker, and run by a dedicated CI job.
 - `config/s3-lifecycle.json`: a ready-to-apply lifecycle policy matching the tag the
   producer writes, plus a prefix-based rule and an `AbortIncompleteMultipartUpload` rule.
   A test asserts the shipped policy and the emitted tag stay in agreement.
