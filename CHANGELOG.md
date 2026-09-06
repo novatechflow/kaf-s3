@@ -1,5 +1,54 @@
 # Changelog
 
+## v1.3.0
+
+### Fixed (blocking)
+- Container and Helm deployments were no-ops: `runtime.py` defined `run()` but had no
+  `__main__` guard, so `python -m s3_connector.runtime` exited 0 immediately. Added a
+  `__main__` module, a `__main__` guard, and a `kaf-s3-connector` console script, which is
+  now the image entrypoint.
+- Setting `dlq_topic` (or `DLQ_TOPIC`) crashed both clients at construction: the key was
+  passed straight to librdkafka, which rejects unknown properties. Connector-only settings
+  are now split out of the client config.
+- `S3Consumer.poll()` raised on tombstones (`AttributeError`), binary inline payloads
+  (`UnicodeDecodeError`) and non-object JSON (`TypeError`) instead of skipping them. A
+  single malformed record could kill every consumer in the group; the runtime loop now
+  also survives unexpected errors.
+
+### Fixed (security)
+- Prometheus label values are escaped, and only `topic`, `partition` and `reason` become
+  series. S3 keys and payload sizes are no longer labels, removing both a metrics
+  injection vector and an unbounded memory leak. Sizes are aggregated into
+  `<event>_bytes` counters.
+- Integrity verification is mandatory by default: a reference carrying neither `etag` nor
+  `sha256` is now rejected rather than trusted. Opt out with `require_integrity: False`.
+- `max_payload_bytes` is enforced on the consumer, bounding both the S3 download and the
+  gzip expansion, so a small object can no longer inflate into an unbounded allocation.
+- Multi-stage Docker build; the compiler and `librdkafka-dev` no longer ship in the final
+  image. Added `.dockerignore` so `.git`, `dist/` and local files stay out of image layers.
+- Metrics bind address is configurable via `METRICS_ADDRESS`.
+
+### Fixed (correctness)
+- Added `S3Producer.flush()`, `close()` and context-manager support. Without them there
+  was no way to guarantee delivery, and queued messages were silently dropped at exit.
+- `S3Consumer.close()` now flushes pending DLQ records before shutting down.
+- Delivery-failure cleanup no longer deletes the S3 object when `deterministic_keys` is
+  enabled, where the same key may back an already-delivered message.
+- `AWS_REGION` / `region_name` reached no client and was silently ignored; it is now
+  applied, alongside a new `endpoint_url` for S3-compatible stores.
+- `requires-python` corrected to `>=3.10`; the code has used PEP 604 syntax since v1.0.0.
+- Metrics server uses `ThreadingHTTPServer`, so one slow scraper can no longer stall the
+  endpoint and trigger liveness-probe restarts.
+- Added `S3Consumer.commit()` and a `skipped` hook, so callers can run at-least-once and
+  can distinguish an empty poll from a dropped message.
+
+### Changed
+- Helm chart ships pod/container security contexts, default resource requests and limits,
+  and pins the image tag to the chart `appVersion` instead of `latest`.
+- CI runs on pushes to `main`, across Python 3.10-3.13, and now builds the image, smoke
+  tests the entrypoint against `/metrics`, and lints/renders the Helm chart.
+- `_version.py` is no longer tracked in git; `.DS_Store` is ignored.
+
 ## v1.2.5
 - Add version validation to PyPI workflow to prevent dev version uploads
 - Note: v1.2.3 and v1.2.4 dev versions were incorrectly published due to setuptools-scm detecting commits after tags

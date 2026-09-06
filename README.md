@@ -13,16 +13,19 @@ This library provides a custom Kafka Producer and Consumer that automatically ha
 
 -   **Automatic S3 Offloading:** Produce messages larger than Kafka's recommended limit without manual intervention.
 -   **Transparent Consumption:** Consume large messages as if they were directly in Kafka.
--   **Data Integrity:** Verifies the integrity of S3 objects using ETags to prevent data corruption.
+-   **Data Integrity:** Verifies every S3 object against the ETag and SHA-256 carried in the reference. References without a verifiable checksum are rejected by default (`require_integrity`).
 -   **Secure by Default:** Leverages AWS IAM roles and the default `boto3` credential chain, avoiding the need to hardcode secrets.
 -   **Flexible Configuration:** Built on top of `confluent-kafka-python`, allowing for full customization of Kafka client settings, including SASL and SSL.
 -   **Operational Ready:** DLQ support, Prometheus `/metrics`, Helm chart, non-root image, optional compression, TTL hints, SSE-KMS.
+-   **Bounded Resources:** `max_payload_bytes` caps both the download and the gzip expansion, so a small object cannot inflate into an unbounded allocation.
 
 ## Installation
 
 ```bash
 pip install .
 ```
+
+Requires Python 3.10 or newer.
 
 ## How it Works
 
@@ -59,9 +62,12 @@ producer_config = {
         # "prefix": "kafka/topic",         # prefix keys for organization/enforcement
         # "deterministic_keys": False,     # use payload hash for idempotent keys
         # "compression": "gzip",           # compress before S3 upload (gzip or None)
-        # "ttl_seconds": 86400,            # hint TTL stored in object metadata
+        # "ttl_seconds": 86400,            # writes a ttl_epoch object metadata hint;
+                                           #   expiry itself requires an S3 lifecycle rule
         # "server_side_encryption": "aws:kms", # SSE, optionally with KMS key below
         # "sse_kms_key_id": "<kms-key-id>",
+        # "region_name": "eu-central-1",   # otherwise the boto3 default chain applies
+        # "endpoint_url": "https://minio.local:9000",  # S3-compatible endpoints
     }
 }
 
@@ -81,6 +87,7 @@ consumer_config = {
         # "delete_after_consume": False,   # delete object only after a successful integrity check
         # "allow_inline_payloads": True,   # allow non-reference payloads to pass through unchanged
         # "prefix": "kafka/topic",         # enforce prefix on incoming references
+        # "require_integrity": True,       # reject references carrying no etag/sha256
         # "compression": "gzip",           # decompress automatically on consume
         # "deterministic_keys": False,     # use payload hash for idempotent keys (producer)
         # "ttl_seconds": 86400,            # hint TTL stored in object metadata (producer)
@@ -106,7 +113,18 @@ with open("examples/sample_payload.txt", "rb") as f:
 
 # Produce the data to a topic
 producer.produce(topic="large-messages-topic", payload=payload_data)
+
+# produce() is asynchronous. Flush before exiting or queued messages are lost.
+producer.flush(timeout=30.0)
+producer.close()
 print("Produced message to Kafka via S3.")
+```
+
+`S3Producer` is also a context manager, which closes (and therefore flushes) on exit:
+
+```python
+with S3Producer(config=producer_config) as producer:
+    producer.produce(topic="large-messages-topic", payload=payload_data)
 ```
 
 ### Consumer
@@ -135,6 +153,27 @@ while True:
         break
 
 consumer.close()
+```
+
+`poll()` returns `None` both when no message arrived and when a message was
+skipped as unusable. Register the `skipped` hook to tell the two apart:
+
+```python
+consumer_config["hooks"] = {
+    "skipped": lambda reason, data: print(f"dropped a message: {reason}"),
+}
+```
+
+For at-least-once delivery, disable auto-commit and commit after processing:
+
+```python
+consumer_config["kafka"]["enable.auto.commit"] = False
+...
+payload = consumer.poll(timeout=10.0)
+if payload:
+    handle(payload)
+    consumer.commit()
+```
 
 ## Testing
 
@@ -192,10 +231,13 @@ echo "hello" | docker run --rm -i \
 Configuration is driven by env vars:
 - Kafka: `KAFKA_BOOTSTRAP_SERVERS`, `KAFKA_GROUP_ID` (consumer), `DLQ_TOPIC`, `KAFKA_SECURITY_PROTOCOL`, `KAFKA_SASL_*`, `KAFKA_SSL_*`, etc.
 - S3: `S3_BUCKET`, `S3_PREFIX`, `S3_DELETE_AFTER_CONSUME`, `S3_ALLOW_INLINE_PAYLOADS`, `S3_MAX_INLINE_BYTES`, `S3_MAX_PAYLOAD_BYTES`, `S3_DETERMINISTIC_KEYS`, `S3_COMPRESSION` (`gzip`), `S3_TTL_SECONDS`, `S3_SSE`, `S3_SSE_KMS_KEY_ID`.
-- App: `MODE` (`producer`|`consumer`), `TOPIC`, `POLL_TIMEOUT`, `METRICS_PORT` (default 8000).
+- App: `MODE` (`producer`|`consumer`), `TOPIC`, `POLL_TIMEOUT`, `METRICS_PORT` (default 8000), `METRICS_ADDRESS` (default all interfaces), `LOG_LEVEL`.
+- Also: `AWS_REGION`, `S3_ENDPOINT_URL`, `S3_REQUIRE_INTEGRITY`.
 
 ### Metrics
 - `/metrics` exposes Prometheus text format on `METRICS_PORT` (default 8000).
+- Only low-cardinality labels (`topic`, `partition`, `reason`) become series. Payload sizes are aggregated into `<event>_bytes` counters rather than one series per size, and S3 keys are never used as labels.
+- The endpoint is unauthenticated. Keep it on an internal network, or bind it explicitly with `METRICS_ADDRESS`.
 - Sample Prometheus scrape config: `config/prometheus.yml`
 - Sample Grafana dashboard JSON: `config/grafana-dashboard.json`
 

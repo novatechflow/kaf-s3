@@ -1,7 +1,3 @@
-import sys
-# Add the src directory to the Python path
-sys.path.append('../src')
-
 from s3_connector import S3Producer
 
 # NOTE: You must have Kafka and S3 (or a compatible service like MinIO)
@@ -37,12 +33,19 @@ def main():
         
         print(f"Producing message from '{file_path}' to topic '{topic}'...")
         producer.produce(topic=topic, payload=payload)
-        print("Message produced successfully.")
+
+        undelivered = producer.flush(timeout=30.0)
+        if undelivered:
+            print(f"{undelivered} message(s) could not be delivered.")
+        else:
+            print("Message produced and delivered successfully.")
 
     except FileNotFoundError:
         print(f"Error: The file '{file_path}' was not found.")
     except Exception as e:
         print(f"An error occurred: {e}")
+    finally:
+        producer.close()
 
 if __name__ == "__main__":
     main()
