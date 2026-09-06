@@ -115,3 +115,74 @@ def test_render_groups_families_and_declares_type():
         'consume_success{topic="a"} 1',
         'consume_success{topic="b"} 1',
     ]
+
+
+def test_auto_commit_can_be_configured_from_env(monkeypatch):
+    """The container needs a way to opt into at-least-once delivery."""
+    monkeypatch.setenv("KAFKA_ENABLE_AUTO_COMMIT", "false")
+    assert build_config_from_env()["kafka"]["enable.auto.commit"] is False
+
+    monkeypatch.setenv("KAFKA_ENABLE_AUTO_COMMIT", "true")
+    assert build_config_from_env()["kafka"]["enable.auto.commit"] is True
+
+    monkeypatch.delenv("KAFKA_ENABLE_AUTO_COMMIT")
+    assert "enable.auto.commit" not in build_config_from_env()["kafka"]
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("true", True), ("TRUE", True), ("1", True), ("yes", True), ("on", True),
+    ("false", False), ("0", False), ("", False), ("nonsense", False),
+])
+def test_boolean_env_vars_share_one_parser(monkeypatch, value, expected):
+    monkeypatch.setenv("S3_DELETE_AFTER_CONSUME", value)
+    assert build_config_from_env()["s3"]["delete_after_consume"] is expected
+
+
+def test_unset_bucket_is_an_empty_string(monkeypatch):
+    """Documents the shape the consumer now rejects instead of accepting."""
+    monkeypatch.delenv("S3_BUCKET", raising=False)
+    assert build_config_from_env()["s3"]["bucket"] == ""
+
+
+def test_consumer_loop_commits_when_auto_commit_is_off(mocker):
+    """Without this the manual-commit container never advances its offsets."""
+    from s3_connector.runtime import _run_consumer
+
+    consumer = mocker.MagicMock()
+    consumer.auto_commit = False
+    consumer.poll.side_effect = [b"payload", b"payload", KeyboardInterrupt()]
+    mocker.patch("s3_connector.runtime.S3Consumer", return_value=consumer)
+
+    _run_consumer({}, "topic", MetricsRegistry())
+
+    assert consumer.commit.call_count == 2
+    assert consumer.commit.call_args.kwargs == {"asynchronous": False}
+    consumer.close.assert_called_once()
+
+
+def test_consumer_loop_does_not_commit_under_auto_commit(mocker):
+    from s3_connector.runtime import _run_consumer
+
+    consumer = mocker.MagicMock()
+    consumer.auto_commit = True
+    consumer.poll.side_effect = [b"payload", KeyboardInterrupt()]
+    mocker.patch("s3_connector.runtime.S3Consumer", return_value=consumer)
+
+    _run_consumer({}, "topic", MetricsRegistry())
+
+    consumer.commit.assert_not_called()
+
+
+def test_consumer_loop_does_not_commit_an_empty_poll(mocker):
+    """commit() with nothing consumed would raise; skipped messages ride along
+    with the next successful commit."""
+    from s3_connector.runtime import _run_consumer
+
+    consumer = mocker.MagicMock()
+    consumer.auto_commit = False
+    consumer.poll.side_effect = [None, None, KeyboardInterrupt()]
+    mocker.patch("s3_connector.runtime.S3Consumer", return_value=consumer)
+
+    _run_consumer({}, "topic", MetricsRegistry())
+
+    consumer.commit.assert_not_called()

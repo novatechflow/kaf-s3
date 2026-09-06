@@ -8,7 +8,7 @@ import time
 import uuid
 from confluent_kafka import Producer
 
-from .config import build_s3_client, split_kafka_config
+from .config import build_s3_client, require_bucket, split_kafka_config
 
 logger = logging.getLogger(__name__)
 
@@ -27,14 +27,12 @@ class S3Producer:
         self.s3_config = config.get("s3", {})
         self.hooks = config.get("hooks", {})
 
-        if "bucket" not in self.s3_config:
-            raise ValueError("S3 bucket must be specified in the configuration.")
+        self.s3_bucket = require_bucket(self.s3_config)
 
         client_config, kafka_dlq_topic = split_kafka_config(kafka_config)
         self.kafka_producer = Producer(client_config)
         self.dlq_topic = kafka_dlq_topic or self.s3_config.get("dlq_topic")
         self.s3_client = build_s3_client(boto3, self.s3_config)
-        self.s3_bucket = self.s3_config["bucket"]
         self.max_inline_bytes = self.s3_config.get("max_inline_bytes", 900_000)
         self.max_payload_bytes = self.s3_config.get("max_payload_bytes", 5 * 1024 * 1024 * 1024)
         self.s3_prefix = self.s3_config.get("prefix", "").rstrip("/")
