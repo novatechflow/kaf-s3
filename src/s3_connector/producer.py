@@ -7,6 +7,7 @@ import logging
 import time
 import urllib.parse
 import uuid
+from boto3.s3.transfer import TransferConfig
 from confluent_kafka import Producer
 
 from .config import build_s3_client, require_bucket, split_kafka_config
@@ -16,6 +17,8 @@ logger = logging.getLogger(__name__)
 # S3 accepts at most 5 GiB in a single PUT; larger objects require multipart.
 SINGLE_PUT_LIMIT_BYTES = 5 * 1024 * 1024 * 1024
 DEFAULT_MULTIPART_THRESHOLD_BYTES = 8 * 1024 * 1024
+# S3 requires every part except the last to be at least 5 MiB.
+MIN_MULTIPART_PART_BYTES = 5 * 1024 * 1024
 DEFAULT_PRODUCE_TIMEOUT_SECONDS = 30.0
 
 class S3Producer:
@@ -198,8 +201,22 @@ class S3Producer:
             self.s3_bucket,
             s3_key,
             ExtraArgs=self._object_kwargs() or None,
+            Config=self._transfer_config(),
         )
         return None
+
+    def _transfer_config(self):
+        """
+        Aligns boto3's managed transfer with multipart_threshold.
+
+        Without this the setting only chooses which API is called: boto3 applies
+        its own 8 MiB threshold, so a payload between the two sizes is uploaded
+        as a single part while the reference still drops its ETag.
+        """
+        return TransferConfig(
+            multipart_threshold=self.multipart_threshold,
+            multipart_chunksize=max(self.multipart_threshold, MIN_MULTIPART_PART_BYTES),
+        )
 
     def flush(self, timeout=30.0):
         """

@@ -549,3 +549,24 @@ def test_shipped_lifecycle_policy_matches_the_tag_we_write():
     )
     tags = [r["Filter"]["Tag"]["Key"] for r in policy["Rules"] if "Tag" in r.get("Filter", {})]
     assert "kaf-s3-ttl-seconds" in tags
+
+
+def test_multipart_threshold_drives_the_boto3_transfer(mocker):
+    """
+    Without an explicit TransferConfig, boto3 applies its own 8 MiB threshold and
+    a payload between the two sizes uploads as a single part while the reference
+    still drops its ETag.
+    """
+    mock_boto3 = mocker.patch("s3_connector.producer.boto3")
+    mocker.patch("s3_connector.producer.Producer")
+
+    cfg = {
+        "kafka": {"bootstrap.servers": "mock:9092"},
+        "s3": {"bucket": "b", "max_inline_bytes": 0, "multipart_threshold": 1024 * 1024},
+    }
+    S3Producer(cfg).produce("topic", b"x" * (2 * 1024 * 1024))
+
+    config = mock_boto3.client.return_value.upload_fileobj.call_args.kwargs["Config"]
+    assert config.multipart_threshold == 1024 * 1024
+    # S3 rejects parts under 5 MiB, so the chunk size floors there.
+    assert config.multipart_chunksize == 5 * 1024 * 1024

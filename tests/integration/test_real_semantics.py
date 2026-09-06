@@ -61,7 +61,7 @@ def test_multipart_etag_is_not_the_content_md5(producer_config, s3, topic):
     """
     payload = os.urandom(6 * 1024 * 1024)
     producer = S3Producer(
-        producer_config(max_inline_bytes=0, multipart_threshold=5 * 1024 * 1024)
+        producer_config(max_inline_bytes=0, multipart_threshold=1024 * 1024)
     )
     producer.produce(topic, payload)
     assert producer.close() == 0
