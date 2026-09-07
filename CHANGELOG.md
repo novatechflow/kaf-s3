@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.0.2
+
+### Changed
+- `delete_after_consume` is now labelled discouraged in the README and in the startup
+  warning, naming S3 lifecycle rules as the recommended mechanism. It remains supported
+  and is not scheduled for removal; the guidance had only ever said "prefer the lifecycle
+  rule", which read as a preference rather than a recommendation against.
+
 ## v2.0.1
 
 ### Fixed
