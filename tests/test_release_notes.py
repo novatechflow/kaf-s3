@@ -58,7 +58,7 @@ def test_changelog_without_sections_is_rejected():
         release_notes.extract("# Changelog\n\nnothing here\n", "v1.4.0", set())
 
 
-def test_real_changelog_matches_the_chart_version():
+def test_chart_app_version_is_a_documented_release():
     changelog = (pathlib.Path(__file__).resolve().parents[1] / "CHANGELOG.md").read_text()
     chart = (
         pathlib.Path(__file__).resolve().parents[1]
@@ -69,7 +69,14 @@ def test_real_changelog_matches_the_chart_version():
         for line in chart.splitlines()
         if line.startswith("appVersion:")
     )
-    notes = release_notes.extract(changelog, app_version, {"v1.2.5"})
-    assert notes.strip()
-    # Nothing between the last real tag and this release may be left unannounced.
+    # The chart's default image tag derives from appVersion, so it has to name a
+    # release the changelog documents. It may trail the top section when the chart
+    # alone changes.
+    assert f"## v{app_version}" in changelog
+
+
+def test_real_changelog_release_notes_reach_the_last_tag():
+    changelog = (pathlib.Path(__file__).resolve().parents[1] / "CHANGELOG.md").read_text()
+    top = next(line[3:].strip() for line in changelog.splitlines() if line.startswith("## "))
+    notes = release_notes.extract(changelog, top, {"v1.2.5"})
     assert "## v1.3.0" in notes

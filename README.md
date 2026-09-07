@@ -1,9 +1,9 @@
 # Kafka S3 Connector (`kaf-s3-connector`)
 
-[![CI](https://github.com/2pk03/kaf-s3/actions/workflows/ci.yml/badge.svg)](https://github.com/2pk03/kaf-s3/actions/workflows/ci.yml)
-[![Docker](https://github.com/2pk03/kaf-s3/actions/workflows/docker.yml/badge.svg)](https://github.com/2pk03/kaf-s3/actions/workflows/docker.yml)
+[![CI](https://github.com/novatechflow/kaf-s3/actions/workflows/ci.yml/badge.svg)](https://github.com/novatechflow/kaf-s3/actions/workflows/ci.yml)
+[![Docker](https://github.com/novatechflow/kaf-s3/actions/workflows/docker.yml/badge.svg)](https://github.com/novatechflow/kaf-s3/actions/workflows/docker.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Container](https://img.shields.io/badge/container-ghcr.io%2F2pk03%2Fkaf--s3--connector-blue)](https://ghcr.io/2pk03/kaf-s3-connector)
+[![Container](https://img.shields.io/badge/container-ghcr.io%2Fnovatechflow%2Fkaf--s3--connector-blue)](https://ghcr.io/novatechflow/kaf-s3-connector)
 
 A Python library to seamlessly handle large Kafka messages by offloading them to Amazon S3.
 
@@ -297,9 +297,9 @@ docker build -t kaf-s3-connector:local .
 Pull from GHCR:
 
 ```bash
-docker pull ghcr.io/2pk03/kaf-s3-connector:latest
+docker pull ghcr.io/novatechflow/kaf-s3-connector:latest
 # or a specific tag (git tag or commit SHA)
-docker pull ghcr.io/2pk03/kaf-s3-connector:v1.0.0
+docker pull ghcr.io/novatechflow/kaf-s3-connector:v2.0.0
 ```
 
 Run as consumer (replace envs as needed):
@@ -349,7 +349,7 @@ Configuration is driven by env vars:
 
 ```bash
 helm upgrade --install kaf-s3 charts/kaf-s3-connector \
-  --set image.repository=ghcr.io/2pk03/kaf-s3-connector \
+  --set image.repository=ghcr.io/novatechflow/kaf-s3-connector \
   --set image.tag=latest \
   --set env.MODE=consumer \
   --set env.TOPIC=large-messages-topic \
