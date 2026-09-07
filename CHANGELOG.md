@@ -1,14 +1,21 @@
 # Changelog
 
-## v1.9.0
+## v2.0.0
 
-This release revisits `delete_after_consume`, which has needed correcting in four
+First release since v1.2.5, gathering everything below it. The major bump is for the
+breaking changes: `delete_after_consume` no longer accepts the default auto-commit
+configuration, and the `LICENSE` file changed.
+
+This release also revisits `delete_after_consume`, which has needed correcting in four
 consecutive releases. The conclusion is that the feature is sound only under a
 precondition it cannot verify, so the release makes the precondition explicit, refuses
 the configuration that is outright unsafe, and promotes S3 lifecycle rules to the
 recommended mechanism by making them actually work.
 
 ### Breaking
+- The `LICENSE` file carried the Apache License 2.0 text while `pyproject.toml`, the PyPI
+  metadata and the README badge all declared MIT. The file now contains the MIT license,
+  matching what every release has been published under.
 - `delete_after_consume` now requires `enable.auto.commit: False` and raises otherwise.
   Under auto-commit the object is removed before the payload is processed, so a crash
   loses the record — a window previously covered by a log warning while doing it anyway.
@@ -27,6 +34,9 @@ recommended mechanism by making them actually work.
   `ttl_seconds` is rejected rather than silently ignored.
 
 ### Added
+- Release notes now cover every CHANGELOG section down to the previous git tag, not just
+  the section matching the tag. v1.3.0 through v1.8.1 were never tagged, so a release of
+  this release would otherwise have announced one section out of eight.
 - An integration suite that runs the connector against a real Kafka broker and a real S3
   service in throwaway containers: round trips across every storage option, plus tests
   pinning the real Kafka and S3 behaviours that past bugs got wrong. Opt-in via

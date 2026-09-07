@@ -13,11 +13,12 @@ This library provides a custom Kafka Producer and Consumer that automatically ha
 
 -   **Automatic S3 Offloading:** Produce messages larger than Kafka's recommended limit without manual intervention.
 -   **Transparent Consumption:** Consume large messages as if they were directly in Kafka.
--   **Data Integrity:** Verifies every S3 object against the ETag and SHA-256 carried in the reference. References without a verifiable checksum are rejected by default (`require_integrity`).
+-   **Data Integrity:** Verifies every S3 object against the SHA-256 and, where S3 provides a usable one, the ETag carried in the reference. References without a verifiable checksum are rejected by default (`require_integrity`).
 -   **Secure by Default:** Leverages AWS IAM roles and the default `boto3` credential chain, avoiding the need to hardcode secrets.
 -   **Flexible Configuration:** Built on top of `confluent-kafka-python`, allowing for full customization of Kafka client settings, including SASL and SSL.
 -   **Operational Ready:** DLQ support, Prometheus `/metrics`, Helm chart, non-root image, optional compression, lifecycle-rule TTL tagging, SSE-KMS.
 -   **Bounded Resources:** `max_payload_bytes` caps both the download and the gzip expansion, so a small object cannot inflate into an unbounded allocation.
+-   **Tested Against Real Infrastructure:** an opt-in suite runs the connector against a real Kafka broker and a real S3 service in throwaway containers, on top of the mocked unit tests.
 
 ## Installation
 
@@ -33,12 +34,22 @@ A message is treated as an S3 reference only if it is a JSON object carrying bot
 `s3_bucket` and `s3_key`. Anything else — plain bytes, or JSON that is simply your own
 payload — passes through untouched when `allow_inline_payloads` is enabled.
 
-1.  The `S3Producer` receives a large payload.
-2.  It uploads the payload to a specified S3 bucket with a unique key.
-3.  It produces a small JSON message to a Kafka topic containing the S3 bucket, key, and the object's ETag.
-4.  The `S3Consumer` reads the JSON reference from Kafka.
-5.  It downloads the original payload from S3.
-6.  It verifies the ETag to ensure the data is not corrupted, then returns the payload to your application.
+1.  The `S3Producer` receives a payload. Anything at or under `max_inline_bytes` is sent
+    to Kafka unchanged and the rest of these steps do not apply.
+2.  Larger payloads are uploaded to the configured bucket under a random key, or a
+    content hash when `deterministic_keys` is set, optionally gzipped and encrypted.
+3.  It produces a small JSON reference to the topic carrying the bucket, the key, a
+    SHA-256 of the payload, the ETag where S3 provides a usable one, and the compression
+    used. If the Kafka publish fails, the S3 object is rolled back.
+4.  The `S3Consumer` recognises a reference by its `s3_bucket` and `s3_key` fields, and
+    passes anything else through as an inline payload.
+5.  It checks the reference against the configured bucket and prefix, downloads the
+    object under a size cap, and decompresses it under the same cap.
+6.  It verifies the payload against the SHA-256 and, where present, the ETag, then returns
+    it. A reference carrying no verifiable checksum is rejected by default.
+
+A multipart upload's ETag is a hash of part hashes rather than of the content, so those
+references omit it and rely on the SHA-256 instead.
 
 ## Configuration
 
@@ -414,3 +425,7 @@ Producer                          Consumer
 
 → [Consulting Services](https://www.novatechflow.com/p/consulting-services.html)  
 → [Book a call](https://cal.com/alexanderalten)
+
+## License
+
+MIT. See [LICENSE](LICENSE).
