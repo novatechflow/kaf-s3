@@ -12,6 +12,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Extract release notes
         run: python .github/scripts/release_notes.py "${{ github.ref_name }}" CHANGELOG.md RELEASE_NOTES.md
