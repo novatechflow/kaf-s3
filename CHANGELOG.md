@@ -1,5 +1,17 @@
 # Changelog
 
+## v2.0.1
+
+### Fixed
+- The README and the Helm chart pointed at `ghcr.io/2pk03/kaf-s3-connector`, which returns
+  403. The repository moved to the `novatechflow` organisation, and the workflow derives
+  the image path from the repository owner, so v2.0.0 published to
+  `ghcr.io/novatechflow/kaf-s3-connector`. Every documented `docker pull` and the chart's
+  default `image.repository` were unusable. Chart version 2.0.1; `appVersion` stays at
+  2.0.0 because the connector itself is unchanged.
+- The README's CI, Docker and container badges pointed at the old owner too, and the
+  documented pull example still named v1.0.0.
+
 ## v2.0.0
 
 First release since v1.2.5, gathering everything below it. The major bump is for the
