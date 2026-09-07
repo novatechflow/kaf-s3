@@ -105,8 +105,9 @@ consumer_config = {
         # Optional toggles
         # "max_inline_bytes": 900_000,     # inline small payloads on Kafka, offload larger ones
         # "max_payload_bytes": 5 * 1024 * 1024 * 1024,  # hard cap on payload size
-        # "delete_after_consume": False,   # single-consumer-group only; needs manual
-                                           #   commits. See "Reclaiming S3 storage"
+        # "delete_after_consume": False,   # discouraged: single-consumer-group only and
+                                           #   needs manual commits. Prefer a lifecycle
+                                           #   rule. See "Reclaiming S3 storage"
         # "allow_inline_payloads": True,   # allow non-reference payloads to pass through unchanged
         # "dlq_max_raw_bytes": 16384,      # raw bytes echoed into a DLQ record
         # "dlq_max_record_bytes": 524288,  # hard cap on the encoded DLQ record
@@ -222,17 +223,19 @@ find its objects gone. S3 expiry is day-granular, so objects live a little past 
 The file also carries a prefix-based rule and an `AbortIncompleteMultipartUpload` rule,
 which is worth enabling on any bucket this library writes to.
 
-**`delete_after_consume` (narrow).** Deletes each object once its message is consumed.
-It reclaims storage immediately rather than a day later, which matters at high volume,
-but it is **only correct when exactly one consumer group reads the topic**. Kafka is a
-fan-out log: any other group still needing that object loses the message, and no consumer
-can detect that another group exists. The connector logs a warning at startup, and that
-is the most it can do.
+**`delete_after_consume` (discouraged).** Deletes each object once its message is
+consumed. It reclaims storage immediately rather than a day later, which matters at high
+volume, but it is **only correct when exactly one consumer group reads the topic**. Kafka
+is a fan-out log: any other group still needing that object loses the message, and no
+consumer can detect that another group exists. The connector logs a warning at startup,
+and that is the most it can do.
 
 It also requires `enable.auto.commit: False` and is refused otherwise — under auto-commit
 the object is removed before the payload is processed, so a crash loses the record.
 
-Given a choice, prefer the lifecycle rule.
+It remains supported and there is no plan to remove it, but a lifecycle rule is the
+recommended mechanism. Reach for this one only when you own every consumer of the topic
+and sub-day reclamation genuinely matters.
 
 #### How deferred deletion behaves
 

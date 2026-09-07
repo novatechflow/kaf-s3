@@ -85,9 +85,11 @@ class S3Consumer:
                     "reclaiming storage; see the README."
                 )
             logger.warning(
-                "delete_after_consume is only safe when this is the sole consumer group "
-                "reading the topic. Any other group still needing the object will lose "
-                "the message. An S3 lifecycle rule has no such constraint."
+                "delete_after_consume is discouraged: it is only correct when this is the "
+                "sole consumer group reading the topic, and no consumer can verify that. "
+                "Any other group still needing the object will lose the message. An S3 "
+                "lifecycle rule reclaims storage with no such constraint and is the "
+                "recommended mechanism. This option remains supported."
             )
 
     def close(self):
