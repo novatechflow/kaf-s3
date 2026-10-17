@@ -388,7 +388,7 @@ This connector was architected as part of a consulting engagement to solve a com
 
 ### The Problem
 
-Kafka is designed for high-throughput streaming but has strict limits on message sizes. When workloads produce large payloads—documents, JSON blobs, binary exports, telemetry batches—teams face a choice: raise broker limits (risky), chunk messages (complex), or find a better pattern.
+Kafka is designed for high-throughput streaming but has strict limits on message sizes. When workloads produce large payloads (documents, JSON blobs, binary exports, telemetry batches), teams face a choice: raise broker limits (risky), chunk messages (complex), or find a better pattern.
 
 ### The Solution
 
@@ -411,10 +411,12 @@ Producer                          Consumer
 
 ### Benefits
 
-- **Removes message size limits** — payloads up to 5GB
-- **Stabilizes Kafka clusters** — brokers never see large messages
-- **Enables lakehouse integration** — S3 objects ready for Iceberg, Spark, Flink
-- **Production-ready** — DLQ, compression, ETag integrity, Prometheus metrics, Helm chart
+- **Removes message size limits**: payloads up to 5GB
+- **Stabilizes Kafka clusters**: brokers never see large messages
+- **Enables lakehouse integration**: S3 objects ready for Iceberg, Spark, Flink
+- **Production-ready**: DLQ, compression, ETag integrity, Prometheus metrics, Helm chart
+
+If you want all of your Kafka data in S3, not only the large payloads, see [KafScale](https://kafscale.io): Kafka-compatible streaming with stateless brokers that keeps data in S3.
 
 ### Use Cases
 
