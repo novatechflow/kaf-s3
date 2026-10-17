@@ -16,6 +16,11 @@ import pytest
 
 from .helpers import BUCKET, wait_for
 
+MINIO_IMAGE = (
+    "cgr.dev/chainguard/minio"
+    "@sha256:c93745c56fccdaf0e5dcb88999a96a65a136428beb045ef5d546255a80d747a7"
+)
+
 try:
     import testcontainers  # noqa: F401
 
@@ -63,7 +68,7 @@ def s3_endpoint():
 
     # MinIO answers SSE-S3 (AES256) only when a KMS key is configured; without one
     # it returns NotImplemented, which would look like a connector bug.
-    container = MinioContainer().with_env(
+    container = MinioContainer(image=MINIO_IMAGE).with_env(
         "MINIO_KMS_SECRET_KEY",
         "kaf-s3-test-key:MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDA=",
     )
