@@ -431,6 +431,10 @@ If you want all of your Kafka data in S3, not only the large payloads, see [KafS
 → [Consulting Services](https://www.novatechflow.com/p/consulting-services.html)  
 → [Book a call](https://cal.com/alexanderalten)
 
+## Further reading
+
+- Blog post: [Kafka to S3 for large messages with kaf-s3](https://www.novatechflow.com/2026/11/kafka-to-s3-for-large-messages-with-kaf.html)
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
